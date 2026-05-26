@@ -1111,6 +1111,31 @@ static void resolve_rf_defaults(void)
     if (span > samp_rate) center_freq = (double)f0 + samp_rate * 0.5 - bw * 0.5;
 }
 
+/* Practical resonant lengths (lambda/4 monopole, lambda/2 dipole) with wire VF. */
+static void print_ideal_antenna_lengths(double f_center_hz,
+                                        double f_lo_hz, double f_hi_hz)
+{
+    const double c  = 299792458.0; /* m/s */
+    const double vf = 0.95;        /* typical solid wire in air */
+
+    if (f_center_hz <= 0.0)
+        return;
+
+    double q_cm = c / (4.0 * f_center_hz) * vf * 100.0;
+    double h_cm = c / (2.0 * f_center_hz) * vf * 100.0;
+    fprintf(stderr,
+            "    antenna (wire VF=%.2f): lambda/4 %.1f cm, lambda/2 %.1f cm @ %.3f MHz\n",
+            vf, q_cm, h_cm, f_center_hz / 1e6);
+
+    if (f_lo_hz > 0.0 && f_hi_hz > f_lo_hz) {
+        double q_lo = c / (4.0 * f_hi_hz) * vf * 100.0; /* shorter at high edge */
+        double q_hi = c / (4.0 * f_lo_hz) * vf * 100.0;
+        fprintf(stderr,
+                "    lambda/4 across coverage: %.1f .. %.1f cm\n",
+                q_lo, q_hi);
+    }
+}
+
 /* ---- Spawn the input source thread ---- */
 
 static int start_input(pthread_t *tid)
@@ -2554,9 +2579,13 @@ static int run_live(void)
     fprintf(stderr, "RF: center %.3f MHz, rate %.3f Msps%s\n",
             center_freq / 1e6, samp_rate / 1e6,
             (opt_sdr_backend == SDR_BACKEND_VITA49) ? " (from VITA-49 context)" : "");
-    fprintf(stderr, "    coverage window: %.3f .. %.3f MHz\n",
-            (center_freq - samp_rate * 0.5) / 1e6,
-            (center_freq + samp_rate * 0.5) / 1e6);
+    {
+        double win_lo_hz = center_freq - samp_rate * 0.5;
+        double win_hi_hz = center_freq + samp_rate * 0.5;
+        fprintf(stderr, "    coverage window: %.3f .. %.3f MHz\n",
+                win_lo_hz / 1e6, win_hi_hz / 1e6);
+        print_ideal_antenna_lengths(center_freq, win_lo_hz, win_hi_hz);
+    }
 
     /* Sanity-check user-supplied --center against the configured region's
      * spectrum. Warn-only -- the user may legitimately be on an SDR with a
