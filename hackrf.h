@@ -11,5 +11,6 @@
 void hackrf_backend_list(void);
 void *hackrf_backend_setup(const char *serial);
 void *hackrf_stream_thread(void *arg);
+void hackrf_request_stop(void);
 
 #endif

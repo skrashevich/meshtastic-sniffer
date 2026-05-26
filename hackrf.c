@@ -10,6 +10,7 @@
 #include <err.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,6 +31,11 @@ extern int hackrf_vga_gain;
 extern int hackrf_amp_enable;
 
 extern void push_samples(sample_buf_t *buf);
+
+/* Active device while hackrf_start_rx() is running; used to call
+ * hackrf_stop_rx() from the main thread on SIGINT so a libusb callback
+ * blocked in push_samples() can return. */
+static _Atomic(hackrf_device *) g_hackrf_active;
 
 void hackrf_backend_list(void)
 {
@@ -103,7 +109,8 @@ void *hackrf_backend_setup(const char *serial)
 
 static int hackrf_rx_cb(hackrf_transfer *t)
 {
-    if (!running) return 0;
+    if (!running || !atomic_load(&g_hackrf_active))
+        return 0;
     int nbytes = t->valid_length;
     sample_buf_t *s = malloc(sizeof(*s) + nbytes);
     if (!s) return 0;
@@ -114,6 +121,13 @@ static int hackrf_rx_cb(hackrf_transfer *t)
     return 0;
 }
 
+void hackrf_request_stop(void)
+{
+    hackrf_device *dev = atomic_load(&g_hackrf_active);
+    if (dev)
+        hackrf_stop_rx(dev);
+}
+
 void *hackrf_stream_thread(void *arg)
 {
     hackrf_device *dev = (hackrf_device *)arg;
@@ -121,9 +135,12 @@ void *hackrf_stream_thread(void *arg)
     if (r != HACKRF_SUCCESS)
         errx(1, "HackRF start_rx: %s", hackrf_error_name(r));
 
+    atomic_store(&g_hackrf_active, dev);
+
     while (running)
         usleep(100000);
 
+    atomic_store(&g_hackrf_active, NULL);
     hackrf_stop_rx(dev);
     hackrf_close(dev);
     hackrf_exit();

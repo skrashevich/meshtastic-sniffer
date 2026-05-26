@@ -9,6 +9,7 @@
 #include <err.h>
 #include <math.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,6 +22,11 @@
 extern int rtl_gain_tenths_db;     /* declared in options.h; if <0, AGC. */
 
 extern void push_samples(sample_buf_t *buf);
+
+/* Set while rtlsdr_read_async() is active so request_input_stop() can
+ * cancel it from the main thread (SIGINT / SIGTERM). Without this,
+ * pthread_join() on the input thread never returns. */
+static _Atomic(rtlsdr_dev_t *) g_rtlsdr_active;
 
 /* ---- Device listing ---- */
 
@@ -172,12 +178,21 @@ static void rtlsdr_async_cb(unsigned char *buf, uint32_t len, void *ctx) {
 
 /* ---- Streaming thread ---- */
 
+void rtlsdr_request_stop(void)
+{
+    rtlsdr_dev_t *dev = atomic_load(&g_rtlsdr_active);
+    if (dev)
+        rtlsdr_cancel_async(dev);
+}
+
 void *rtlsdr_stream_thread(void *arg) {
     rtlsdr_dev_t *dev = (rtlsdr_dev_t *)arg;
 
+    atomic_store(&g_rtlsdr_active, dev);
     /* Use smaller buffers (16384 bytes = 8192 samples ~3.4ms at 2.4MHz)
      * to avoid bursty processing from the default 256KB buffers. */
     rtlsdr_read_async(dev, rtlsdr_async_cb, NULL, 15, 16384);
+    atomic_store(&g_rtlsdr_active, NULL);
 
     running = 0;
     return NULL;

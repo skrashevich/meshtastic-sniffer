@@ -82,10 +82,41 @@
 pid_t self_pid;
 pthread_mutex_t fftw_planner_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+static volatile sig_atomic_t g_sig_count = 0;
+
+static void request_input_stop(void)
+{
+    switch (opt_sdr_backend) {
+#ifdef HAVE_HACKRF
+    case SDR_BACKEND_HACKRF:
+        hackrf_request_stop();
+        break;
+#endif
+#ifdef HAVE_RTLSDR
+    case SDR_BACKEND_RTLSDR:
+        rtlsdr_request_stop();
+        break;
+#endif
+    default:
+        break;
+    }
+}
+
 static void on_signal(int sig)
 {
-    (void)sig;
+    if (++g_sig_count >= 2)
+        _exit(128 + sig);
     running = 0;
+}
+
+static void install_signal_handlers(void)
+{
+    struct sigaction sa = {0};
+    sa.sa_handler = on_signal;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT,  &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    signal(SIGPIPE, SIG_IGN);
 }
 
 /* ---- Global pipeline state ---- */
@@ -189,6 +220,19 @@ static sample_pump_t g_sample_pump = {
     .not_full = PTHREAD_COND_INITIALIZER,
     .drained = PTHREAD_COND_INITIALIZER,
 };
+
+static void sample_pipeline_begin_stop(void)
+{
+    pthread_mutex_lock(&g_sample_pump.mu);
+    if (!g_sample_pump.started) {
+        pthread_mutex_unlock(&g_sample_pump.mu);
+        return;
+    }
+    g_sample_pump.closing = 1;
+    pthread_cond_broadcast(&g_sample_pump.not_empty);
+    pthread_cond_broadcast(&g_sample_pump.not_full);
+    pthread_mutex_unlock(&g_sample_pump.mu);
+}
 
 static int sample_pump_stats_enabled(void)
 {
@@ -374,17 +418,22 @@ static void sample_pipeline_stop(void)
 void push_samples(sample_buf_t *buf)
 {
     if (!buf) return;
+    if (!running) {
+        free(buf);
+        return;
+    }
     pthread_mutex_lock(&g_sample_pump.mu);
     if (!g_sample_pump.started || g_sample_pump.closing) {
         pthread_mutex_unlock(&g_sample_pump.mu);
         process_sample_buf(buf);
         return;
     }
-    while (g_sample_pump.size == g_sample_pump.cap && !g_sample_pump.closing) {
+    while (g_sample_pump.size == g_sample_pump.cap &&
+           !g_sample_pump.closing && running) {
         atomic_fetch_add(&g_sample_pump.queue_waits, 1);
         pthread_cond_wait(&g_sample_pump.not_full, &g_sample_pump.mu);
     }
-    if (g_sample_pump.closing) {
+    if (g_sample_pump.closing || !running) {
         pthread_mutex_unlock(&g_sample_pump.mu);
         free(buf);
         return;
@@ -2722,6 +2771,13 @@ static int run_live(void)
     while (running)
         usleep(100000);
 
+    /* Stop accepting samples before joining the SDR thread. Async backends
+     * (HackRF libusb callback, etc.) can block in push_samples() on a full
+     * queue; closing the pump + stop_rx unblocks that path on Ctrl-C. */
+    sample_pipeline_begin_stop();
+    request_input_stop();
+    if (opt_web_port > 0)
+        web_shutdown();
     pthread_join(input_tid, NULL);
     sample_pipeline_stop();
     pthread_join(stats_tid, NULL);
@@ -2787,9 +2843,7 @@ int main(int argc, char **argv)
     if (rc == 1) return 0;        /* --help */
     if (rc >= 2 && rc != 100 && rc != 101 && rc != 102 && rc != 103 && rc != 104 && rc != 105) return rc;
 
-    signal(SIGINT,  on_signal);
-    signal(SIGTERM, on_signal);
-    signal(SIGPIPE, SIG_IGN);
+    install_signal_handlers();
 
     simd_init(opt_force_simd_generic);
 
