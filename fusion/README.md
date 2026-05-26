@@ -47,12 +47,25 @@ services:
     ports:
       - "9000:9000"
     volumes:
-      - ./fusion-data:/data
+      # Recommended: named volume so permissions "just work" with the
+      # container's non-root user.
+      - fusion-data:/data
     command:
       - --listen=:9000
       - --api-token=CHANGE_ME
       - --state-db=/data/state.db
       - --sensors-file=/data/sensors.json
+
+volumes:
+  fusion-data: {}
+```
+
+If you prefer a bind-mount (e.g. `./fusion-data:/data`), make the host
+directory writable by the container user (UID 65532):
+
+```bash
+mkdir -p ./fusion-data
+sudo chown -R 65532:65532 ./fusion-data
 ```
 
 Then open `http://localhost:9000/?token=CHANGE_ME` and add your sensors in the **Sensors** tab.
