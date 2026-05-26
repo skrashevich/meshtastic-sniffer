@@ -12,6 +12,7 @@
 void rtlsdr_backend_list(void);
 void *rtlsdr_backend_setup(int dev_index);
 void *rtlsdr_stream_thread(void *arg);
+void rtlsdr_request_stop(void);
 void rtlsdr_backend_close(void *ctx);
 
 #endif

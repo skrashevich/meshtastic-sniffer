@@ -16,6 +16,7 @@
 #include "gpsd.h"
 #include "options.h"
 
+#include <errno.h>
 #include <netdb.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -149,11 +150,20 @@ static void *gpsd_thread_fn(void *arg)
         ssize_t wn = write(fd, watch, strlen(watch));
         (void)wn;
 
+        /* Bounded read so shutdown (running=0) is not stuck in read(). */
+        struct timeval rcv_to = { .tv_sec = 1, .tv_usec = 0 };
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rcv_to, sizeof(rcv_to));
+
         char  buf[4096];
         size_t off = 0;
         while (g_run && running) {
             ssize_t n = read(fd, buf + off, sizeof(buf) - 1 - off);
-            if (n <= 0) break;
+            if (n < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+                    continue;
+                break;
+            }
+            if (n == 0) break;
             off += (size_t)n;
             buf[off] = 0;
             char *line = buf, *end;
