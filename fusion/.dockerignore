@@ -1,0 +1,8 @@
+**/.git
+**/.github
+**/*.test
+**/*.out
+**/*.log
+**/tmp
+**/build
+**/dist

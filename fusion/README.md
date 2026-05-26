@@ -31,6 +31,32 @@ cd fusion
 go build -o meshtastic-fusion ./...
 ```
 
+## Docker / docker compose
+
+Image is published to GHCR from your fork via the included GitHub Actions workflow:
+
+- `ghcr.io/<YOUR_GH_USERNAME>/meshtastic-fusion:latest`
+
+Example `docker-compose.yml`:
+
+```yaml
+services:
+  fusion:
+    image: ghcr.io/<YOUR_GH_USERNAME>/meshtastic-fusion:latest
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+    volumes:
+      - ./fusion-data:/data
+    command:
+      - --listen=:9000
+      - --api-token=CHANGE_ME
+      - --state-db=/data/state.db
+      - --sensors-file=/data/sensors.json
+```
+
+Then open `http://localhost:9000/?token=CHANGE_ME` and add your sensors in the **Sensors** tab.
+
 Run a single sniffer + fusion on the same machine:
 
 ```bash
