@@ -17,18 +17,46 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* ---- POSITION_APP (port 3) ---- */
+/* ---- POSITION_APP (port 3) ---- meshtastic.Position
+ *
+ * Field numbers, wire types, and units mirror the current upstream proto
+ * (meshtastic/protobufs mesh.proto, "message Position"). lat_i/lon_i are
+ * sfixed32 -- 4 raw little-endian bytes per side, two's-complement
+ * signed -- not varint+zigzag; altitude_hae and altitude_geoidal_separation
+ * are sint32 (varint+zigzag, signed-magnitude). Everything else is plain
+ * varint (uint32 or int32) or fixed32 per the proto.
+ *
+ * have_* flags are per-field so a consumer can tell "0 explicit" from
+ * "0 because the sender didn't include this field." Required for the JSON
+ * feed not to lie when a node only sends partial Position. */
 typedef struct mesh_position {
-    bool     have_lat, have_lon, have_alt;
-    double   lat_deg, lon_deg;
-    int32_t  altitude_m;
-    uint32_t time_unix;
-    uint32_t sats_in_view;
-    uint32_t pdop_x100;       /* PDOP * 100 */
-    uint32_t ground_speed_mps;
-    uint32_t ground_track;    /* degrees */
-    uint32_t precision_bits;
-    uint32_t location_source; /* enum LocationSource */
+    bool     have_lat, have_lon;
+    bool     have_alt, have_alt_hae, have_alt_geosep;
+    bool     have_time, have_timestamp;
+    bool     have_ground_speed, have_ground_track;
+
+    double   lat_deg, lon_deg;             /* sfixed32 fields 1,2 * 1e-7 -> degrees */
+    int32_t  altitude_m;                   /* int32  field 3:  MSL altitude (meters) */
+    uint32_t time;                         /* fixed32 field 4: sender wall-clock when message was sent (epoch s) */
+    uint32_t location_source;              /* enum    field 5:  LocSource */
+    uint32_t altitude_source;              /* enum    field 6:  AltSource */
+    uint32_t timestamp;                    /* fixed32 field 7:  actual GPS-fix timestamp (epoch s) */
+    int32_t  timestamp_millis_adjust;      /* int32   field 8:  ms adjustment relative to `timestamp` */
+    int32_t  altitude_hae_m;               /* sint32  field 9:  HAE altitude (meters) */
+    int32_t  altitude_geoidal_separation_m;/* sint32  field 10: geoid separation (meters) */
+    uint32_t pdop_x100;                    /* uint32  field 11: PDOP * 100 */
+    uint32_t hdop_x100;                    /* uint32  field 12: HDOP * 100 */
+    uint32_t vdop_x100;                    /* uint32  field 13: VDOP * 100 */
+    uint32_t gps_accuracy_mm;              /* uint32  field 14: hardware constant (mm) */
+    uint32_t ground_speed_mps;             /* uint32  field 15: m/s */
+    uint32_t ground_track_x100;            /* uint32  field 16: 1/100 degrees */
+    uint32_t fix_quality;                  /* uint32  field 17: NMEA fix quality */
+    uint32_t fix_type;                     /* uint32  field 18: NMEA fix type (2D/3D) */
+    uint32_t sats_in_view;                 /* uint32  field 19 */
+    uint32_t sensor_id;                    /* uint32  field 20 */
+    uint32_t next_update_s;                /* uint32  field 21: expected seconds until next update */
+    uint32_t seq_number;                   /* uint32  field 22 */
+    uint32_t precision_bits;               /* uint32  field 23 */
 } mesh_position_t;
 bool mesh_decode_position(const uint8_t *buf, size_t len, mesh_position_t *out);
 
@@ -44,6 +72,8 @@ typedef struct mesh_user {
     uint32_t role;            /* enum Role */
     uint8_t  public_key[32];
     bool     have_public_key;
+    bool     is_unmessagable;
+    bool     have_is_unmessagable;
 } mesh_user_t;
 bool mesh_decode_user(const uint8_t *buf, size_t len, mesh_user_t *out);
 
@@ -65,18 +95,90 @@ typedef struct mesh_telemetry {
     float    gas_resistance;
     float    voltage_env;
     float    current;
-    float    iaq;
+    uint32_t iaq;                         /* field 7: uint32 per proto, NOT float */
     float    distance_mm;
-    float    lux, white_lux, ir_lumens, uv_lux;
-    float    wind_direction;
+    float    lux, white_lux, ir_lux, uv_lux;
+    uint32_t wind_direction;              /* field 13: uint32 per proto, NOT float */
     float    wind_speed;
-    float    wind_gust;
-    float    wind_lull;
+    float    weight;                      /* field 15 */
+    float    wind_gust;                   /* field 16 (was wired to field 15) */
+    float    wind_lull;                   /* field 17 (was wired to field 16) */
+    float    radiation_uSvh;              /* field 18 */
+    float    rainfall_1h_mm;              /* field 19 */
+    float    rainfall_24h_mm;             /* field 20 */
+    uint32_t soil_moisture;               /* field 21 */
+    float    soil_temperature_c;          /* field 22 */
 
     bool     have_power;
     float    ch1_voltage, ch1_current;
     float    ch2_voltage, ch2_current;
     float    ch3_voltage, ch3_current;
+    float    ch4_voltage, ch4_current;
+    float    ch5_voltage, ch5_current;
+    float    ch6_voltage, ch6_current;
+    float    ch7_voltage, ch7_current;
+    float    ch8_voltage, ch8_current;
+
+    bool     have_air_quality;
+    uint32_t aq_pm10_standard, aq_pm25_standard, aq_pm100_standard;
+    uint32_t aq_pm10_env,      aq_pm25_env,      aq_pm100_env;
+    uint32_t aq_particles_03um, aq_particles_05um, aq_particles_10um;
+    uint32_t aq_particles_25um, aq_particles_50um, aq_particles_100um;
+    uint32_t aq_co2;
+    float    aq_co2_temperature_c;
+    float    aq_co2_humidity;
+    float    aq_formaldehyde_ppb;
+    float    aq_form_humidity;
+    float    aq_form_temperature_c;
+    uint32_t aq_pm40_standard;
+    uint32_t aq_particles_40um;
+    float    aq_pm_temperature_c;
+    float    aq_pm_humidity;
+    float    aq_pm_voc_idx;
+    float    aq_pm_nox_idx;
+    float    aq_particles_tps;
+
+    bool     have_local_stats;
+    uint32_t local_uptime_s;
+    float    local_channel_utilization;
+    float    local_air_util_tx;
+    uint32_t local_num_packets_tx;
+    uint32_t local_num_packets_rx;
+    uint32_t local_num_packets_rx_bad;
+    uint32_t local_num_online_nodes;
+    uint32_t local_num_total_nodes;
+    uint32_t local_num_rx_dupe;
+    uint32_t local_num_tx_relay;
+    uint32_t local_num_tx_relay_canceled;
+    uint32_t local_heap_total_bytes;
+    uint32_t local_heap_free_bytes;
+    uint32_t local_num_tx_dropped;
+    int32_t  local_noise_floor_dbm;
+
+    bool     have_health;
+    uint32_t health_heart_bpm;
+    uint32_t health_spo2;
+    float    health_temperature_c;
+
+    bool     have_host;
+    uint32_t host_uptime_s;
+    uint64_t host_freemem_bytes;
+    uint64_t host_diskfree1_bytes;
+    uint64_t host_diskfree2_bytes;
+    uint64_t host_diskfree3_bytes;
+    uint32_t host_load1_x100;
+    uint32_t host_load5_x100;
+    uint32_t host_load15_x100;
+    char     host_user_string[64];
+
+    bool     have_traffic_mgmt;
+    uint32_t tm_packets_inspected;
+    uint32_t tm_position_dedup_drops;
+    uint32_t tm_nodeinfo_cache_hits;
+    uint32_t tm_rate_limit_drops;
+    uint32_t tm_unknown_packet_drops;
+    uint32_t tm_hop_exhausted_packets;
+    uint32_t tm_router_hops_preserved;
 } mesh_telemetry_t;
 bool mesh_decode_telemetry(const uint8_t *buf, size_t len, mesh_telemetry_t *out);
 
@@ -138,6 +240,11 @@ typedef struct mesh_atak {
     char     chat_message[200];
     char     chat_to[64];
     char     chat_to_callsign[32];
+    char     chat_receipt_for_uid[64];   /* GeoChat field 4: uid of acked message */
+    uint32_t chat_receipt_type;          /* GeoChat field 5: 0 normal, 1 delivered, 2 read */
+    char     chat_lang[16];              /* GeoChat field 6: TAKTALK language tag */
+    char     chat_room_id[40];           /* GeoChat field 7: TAKTALK chatroom UUID */
+    bool     chat_has_voice_profile;     /* GeoChat field 8: TAKTALK voice profile marker */
 
     /* DETAIL variant -- raw CoT XML bytes for republish */
     const uint8_t *detail_xml;
@@ -179,14 +286,12 @@ bool mesh_decode_neighborinfo(const uint8_t *buf, size_t len, mesh_neighborinfo_
 
 /* ---- KEY_VERIFICATION_APP (port 12) ----
  *
- * KeyVerification message: { nonce uint64, hash1 bytes, hash2 bytes,
- * remote_node_id uint32 }. We surface only the non-secret metadata
- * (nonce, remote_node_id, hash sizes) so observers can see that two
- * nodes are exchanging key-verification messages without leaking the
- * hashes themselves to the JSON feed. */
+ * KeyVerification message: { nonce uint64, hash1 bytes, hash2 bytes }.
+ * We surface only the non-secret metadata (nonce, hash sizes) so
+ * observers can see that two nodes are exchanging key-verification
+ * messages without leaking the hashes themselves to the JSON feed. */
 typedef struct mesh_keyverif {
     uint64_t nonce;
-    uint32_t remote_node_id;
     int      hash1_len;
     int      hash2_len;
 } mesh_keyverif_t;
@@ -237,14 +342,13 @@ bool mesh_decode_traceroute(const uint8_t *buf, size_t len, mesh_traceroute_t *o
 
 /* ---- REMOTE_HARDWARE_APP (port 2) ----
  *
- * HardwareMessage: { type enum, gpio_mask uint64, gpio_value uint64,
- * txid uint32 }. Surfaced fields let an observer see a remote-GPIO
- * RPC happening (read/write/notify) without making policy on it. */
+ * HardwareMessage: { type enum, gpio_mask uint64, gpio_value uint64 }.
+ * Surfaced fields let an observer see a remote-GPIO RPC happening
+ * (read/write/notify) without making policy on it. */
 typedef struct mesh_remote_hw {
     uint32_t type;       /* HardwareMessage.Type enum */
     uint64_t gpio_mask;
     uint64_t gpio_value;
-    uint32_t txid;
 } mesh_remote_hw_t;
 bool mesh_decode_remote_hw(const uint8_t *buf, size_t len, mesh_remote_hw_t *out);
 

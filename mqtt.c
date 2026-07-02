@@ -51,7 +51,11 @@ void mqtt_init(void)
         const char *st = opt_station_id ? opt_station_id : "default";
         size_t n = strlen("meshtastic/") + strlen(st) + 1;
         g_topic = malloc(n);
-        snprintf(g_topic, n, "meshtastic/%s", st);
+        if (g_topic) snprintf(g_topic, n, "meshtastic/%s", st);
+    }
+    if (!g_topic) {
+        fprintf(stderr, "mqtt: topic allocation failed; publish disabled.\n");
+        return;
     }
     if (verbose) fprintf(stderr, "mqtt: connected %s:%d topic %s\n",
                           opt_mqtt_host, opt_mqtt_port, g_topic);

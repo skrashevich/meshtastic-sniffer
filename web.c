@@ -111,11 +111,34 @@ static const char DASHBOARD_HTML[] =
 ".log-item{padding:5px 0;border-bottom:1px dotted #1e293b;font-size:12px;line-height:1.5;word-wrap:break-word}\n"
 ".log-item .ts{color:#64748b;font-size:11px;margin-right:6px}\n"
 ".log-item b{color:#38bdf8}\n"
+".port{color:#a78bfa;font-size:10px;text-transform:uppercase;letter-spacing:0.5px;background:#1e1b2e;padding:1px 5px;border-radius:3px;margin:0 4px}\n"
+".snr-arrow{margin-left:3px;font-size:12px;line-height:1}\n"
+".snr-up   {color:#4ade80}\n"
+".snr-down {color:#f87171}\n"
+".snr-flat {color:#64748b}\n"
 /* Config + Activity tabs are plain block content -- override the
  * .tab.active{display:flex} that's right for Live.
  * Topology tab uses a flex column so the canvas can fill the pane. */
 "#config.tab.active,#activity.tab.active{display:block}\n"
 "#topology.tab.active{display:flex;flex-direction:column}\n"
+/* Spectrum: column flex so the canvas wrap can fill the pane and we
+ * can stretch the canvas to its parent's box. */
+"#spectrum.tab.active{display:flex;flex-direction:column}\n"
+"#spec-strip{display:flex;align-items:center;gap:12px;padding:6px 12px;background:#1e293b;border-bottom:1px solid #334155;flex-shrink:0}\n"
+"#spec-strip button{background:#334155;color:#cbd5e1;border:1px solid #475569;border-radius:3px;padding:3px 12px;cursor:pointer;font:inherit;font-size:11px}\n"
+"#spec-strip button.on{background:#0ea5e9;color:#0b1220;border-color:#38bdf8}\n"
+"#spec-wrap{flex:1;position:relative;background:#000;overflow:hidden}\n"
+"#spec-canvas{display:block;width:100%;height:100%}\n"
+"html.light #spec-strip{background:#ffffff;border-bottom-color:#cbd5e1}\n"
+"html.light #spec-strip button{background:#e2e8f0;color:#0f172a;border-color:#cbd5e1}\n"
+"html.light #spec-wrap{background:#0b1220}\n"
+"#spec-wrap.scroll{cursor:ns-resize}\n"
+"#spec-wrap.over-box{cursor:help}\n"
+"#spec-tip{position:absolute;pointer-events:none;background:rgba(15,23,42,0.95);color:#e2e8f0;border:1px solid #475569;border-radius:4px;padding:6px 8px;font:11px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;max-width:360px;white-space:pre;z-index:5;display:none}\n"
+"#spec-tip .hd{color:#38bdf8;font-weight:600;margin-bottom:2px}\n"
+"#spec-tip .bad{color:#f87171}\n"
+"#spec-tip .ok{color:#34d399}\n"
+"#spec-tip pre{margin:6px 0 0;padding:6px;background:#020617;border-radius:3px;color:#94a3b8;font-size:10px;max-height:140px;overflow:hidden;white-space:pre-wrap;word-break:break-all}\n"
 "#topology{position:relative;overflow:hidden}\n"
 "#topo-canvas{flex:1;display:block;width:100%;background:#0f172a;cursor:default}\n"
 "#topo-canvas.hovering{cursor:pointer}\n"
@@ -258,11 +281,18 @@ static const char DASHBOARD_HTML[] =
 "  <span class=\"stat\">Frames <span id=\"st-frames\" class=\"val\">0</span></span>\n"
 "  <span class=\"stat\">Decrypted <span id=\"st-decrypted\" class=\"val\">0</span></span>\n"
 "  <span class=\"stat\" id=\"st-offgrid-wrap\" style=\"display:none\">Off-grid <span id=\"st-offgrid\" class=\"val\">0</span></span>\n"
+"  <span class=\"stat\" id=\"st-focus-wrap\" style=\"display:none\" title=\"Focused pool: workers / promotions / dropped / below-snr / cumulative focus-decoded frames\">Focus <span id=\"st-focus\" class=\"val\">--</span></span>\n"
+"  <span class=\"stat\" id=\"st-clock-wrap\" style=\"display:none\" title=\"Self-reported clock-discipline class (--station-t-acc-ns). Affects TDOA accuracy when 3+ stations correlate.\">Clock <span id=\"st-clock\" class=\"val\">--</span></span>\n"
 "  <span id=\"status\">connecting...</span>\n"
 "  <button id=\"theme-toggle\" onclick=\"toggleTheme()\" title=\"Toggle light/dark theme\">dark</button>\n"
 "</div>\n"
 "<div id=\"tabs\">\n"
 "  <button id=\"tab-live\" class=\"active\" onclick=\"showTab('live')\">Live</button>\n"
+/* Spectrum sits next to Live -- once the waterfall is on, the RF
+ * context is part of the main operating loop, not a side feature.
+ * Hidden in CSS until the first WATERFALL SSE event arrives so a
+ * sensor running without --web-waterfall never shows an empty tab. */
+"  <button id=\"tab-spectrum\" onclick=\"showTab('spectrum')\" style=\"display:none\">Spectrum</button>\n"
 "  <button id=\"tab-activity\" onclick=\"showTab('activity')\">Activity</button>\n"
 "  <button id=\"tab-topology\" onclick=\"showTab('topology')\">Topology</button>\n"
 "  <button id=\"tab-config\" onclick=\"showTab('config')\">Config</button>\n"
@@ -283,7 +313,7 @@ static const char DASHBOARD_HTML[] =
 "        <tbody></tbody>\n"
 "      </table>\n"
 "    </div>\n"
-"    <div class=\"pane\"><h2>Channels <span class=muted>(by hash)</span></h2><table id=\"channels\"><thead><tr><th>Hash</th><th>Name</th><th>Preset</th><th>Frames</th><th>Decrypt</th><th>Slots</th><th>Last</th></tr></thead><tbody></tbody></table></div>\n"
+"    <div class=\"pane\"><h2>Channels <span class=muted>(by hash)</span></h2><table id=\"channels\"><thead><tr><th>Hash</th><th>Name</th><th>Preset</th><th>Frames</th><th>Decrypt</th><th>Slots</th><th>SNR (1h)</th><th>Last</th></tr></thead><tbody></tbody></table></div>\n"
 "    <div class=\"pane\"><h2>Messages</h2><div id=\"msgs\"></div></div>\n"
 "    <div class=\"pane\"><h2>Discoveries &amp; ATAK</h2><div id=\"disc\"></div></div>\n"
 "  </div>\n"
@@ -332,6 +362,19 @@ static const char DASHBOARD_HTML[] =
 "    <div class=\"hint\">Off by default. Frames without verified bytes (e.g. cross-slot phantoms of a real TX, or noise patterns that passed the 5-bit header checksum by chance) decode to corrupted from/to/packet_id fields. Surfacing them invents nodes that don't exist. Turn this on for diagnostic inspection of what the demod produced before trust filtering.</div>\n"
 "  </div>\n"
 "</div>\n"
+/* Spectrum tab: top strip with frequency span + pause; canvas fills
+ * the rest. Time on Y (newest at top), frequency on X. Hidden until
+ * the first WATERFALL row arrives. */
+"<div id=\"spectrum\" class=\"tab\">\n"
+"  <div id=\"spec-strip\">\n"
+"    <span id=\"spec-range\" class=\"hint\">--</span>\n"
+"    <span class=\"hint\">@ <span id=\"spec-rate\">--</span> Hz</span>\n"
+"    <span style=\"flex:1\"></span>\n"
+"    <button id=\"spec-pause\" onclick=\"toggleSpectrumPause()\">Pause</button>\n"
+"    <span id=\"spec-pause-status\" class=\"hint\"></span>\n"
+"  </div>\n"
+"  <div id=\"spec-wrap\"><canvas id=\"spec-canvas\"></canvas><div id=\"spec-tip\"></div></div>\n"
+"</div>\n"
 "<aside id=\"drawer\" aria-hidden=\"true\">\n"
 "  <div id=\"drawer-head\">\n"
 "    <div class=\"grow\"><div class=\"nm\" id=\"d-name\">--</div><div class=\"id\" id=\"d-id\">--</div></div>\n"
@@ -351,7 +394,7 @@ static const char DASHBOARD_HTML[] =
 "</aside>\n"
 "<script>\n"
 "function showTab(name){\n"
-"  for(const t of ['live','activity','topology','config']){\n"
+"  for(const t of ['live','activity','topology','config','spectrum']){\n"
 "    document.getElementById(t).classList.toggle('active',t===name);\n"
 "    document.getElementById('tab-'+t).classList.toggle('active',t===name);\n"
 "  }\n"
@@ -362,6 +405,7 @@ static const char DASHBOARD_HTML[] =
 "  if (name==='live') setTimeout(()=>map.invalidateSize(),60);\n"
 "  if (name==='activity') renderActivity();\n"
 "  if (name==='topology') topoStart(); else topoStop();\n"
+"  if (name==='spectrum') spectrumStart(); else spectrumStop();\n"
 "}\n"
 "// Theme toggle: dark is default, light persists in localStorage. Map\n"
 "// tile layer swaps between Carto dark/light to match. Same pattern as\n"
@@ -391,6 +435,10 @@ static const char DASHBOARD_HTML[] =
 "  } catch (err) { btn.textContent = 'error'; btn.disabled = false; }\n"
 "});\n"
 "const chTbody = document.querySelector('#channels tbody');\n"
+/* Per-slot rolling SNR history, keyed by physical slot id. Filled from
+ * CHAN_SNR SSE events; renderChannels() averages buckets across the
+ * slots that map to each channel hash. */
+"const chanSnr = {};\n"
 "const nodesCount = document.getElementById('nodes-count');\n"
 "const nodesSearch = document.getElementById('nodes-search');\n"
 "// LRU cap on the nodes map. Busy environments produce hundreds of\n"
@@ -614,6 +662,53 @@ static const char DASHBOARD_HTML[] =
 "  channelsRafQueued = true;\n"
 "  requestAnimationFrame(()=>{ channelsRafQueued = false; renderChannels(); });\n"
 "}\n"
+/* aggregateSnr -- collapse per-slot rings into one 60-bucket view for
+ * the channel hash (which can span multiple physical slots). Each
+ * bucket is the mean across slots that had data in that minute. */
+"function aggregateSnr(slotSet){\n"
+"  const out = new Array(60).fill(null);\n"
+"  const sum = new Array(60).fill(0);\n"
+"  const cnt = new Array(60).fill(0);\n"
+"  if (!slotSet) return out;\n"
+"  for (const slot of slotSet){\n"
+"    const ring = chanSnr[slot];\n"
+"    if (!ring) continue;\n"
+"    for (let i=0; i<60 && i<ring.length; i++){\n"
+"      if (ring[i] >= 0){ sum[i] += ring[i]; cnt[i] += 1; }\n"
+"    }\n"
+"  }\n"
+"  for (let i=0; i<60; i++) if (cnt[i]) out[i] = sum[i]/cnt[i];\n"
+"  return out;\n"
+"}\n"
+/* snrSummary -- compress the 60-bucket history into one cell:
+ *   current = newest populated minute (rounded dB)
+ *   trend   = least-squares slope over up to 10 most-recent populated
+ *             buckets. slope > +0.5 dB/min = up, < -0.5 = down, else
+ *             flat. Returns null when nothing populated so the cell
+ *             shows '--' instead of confusing zeros. */
+"function snrSummary(buckets){\n"
+"  let current = null, currentIdx = -1;\n"
+"  for (let i = buckets.length - 1; i >= 0; i--){\n"
+"    if (buckets[i] !== null){ current = buckets[i]; currentIdx = i; break; }\n"
+"  }\n"
+"  if (currentIdx < 0) return null;\n"
+"  const xs = [], ys = [];\n"
+"  for (let i = currentIdx; i >= 0 && xs.length < 10; i--){\n"
+"    if (buckets[i] !== null){ xs.push(i); ys.push(buckets[i]); }\n"
+"  }\n"
+"  let trend = 'flat';\n"
+"  if (ys.length >= 3){\n"
+"    const n = ys.length;\n"
+"    const mx = xs.reduce((a,b)=>a+b,0)/n;\n"
+"    const my = ys.reduce((a,b)=>a+b,0)/n;\n"
+"    let num = 0, den = 0;\n"
+"    for (let i = 0; i < n; i++){ const dx = xs[i]-mx; num += dx*(ys[i]-my); den += dx*dx; }\n"
+"    const slope = den ? num/den : 0;\n"
+"    if (slope >  0.5) trend = 'up';\n"
+"    else if (slope < -0.5) trend = 'down';\n"
+"  }\n"
+"  return { current: Math.round(current), trend };\n"
+"}\n"
 "function renderChannels(){\n"
 "  const hashes = Object.keys(channels).sort((a,b)=>channels[b].ts-channels[a].ts);\n"
 "  const frag = document.createDocumentFragment();\n"
@@ -629,8 +724,12 @@ static const char DASHBOARD_HTML[] =
 "    const decCell = c.decrypted>0 ? `${c.decrypted}/${c.total} (${dec}%)` : `<span class=muted>0/${c.total}</span>`;\n"
 "    const slotN = c.slots ? c.slots.size : 0;\n"
 "    const slotCell = slotN>0 ? (c.lastSlot!==undefined ? `${slotN} <span class=muted>(last #${c.lastSlot})</span>` : `${slotN}`) : '<span class=muted>--</span>';\n"
-"    tr.innerHTML=`<td>${hashHex}</td><td>${name}</td><td>${preset}</td><td>${c.total}</td><td>${decCell}</td><td>${slotCell}</td><td>${fmtTime(c.ts)}</td>`;\n"
-"    frag.appendChild(tr);}\n"
+"    const s = snrSummary(aggregateSnr(c.slots));\n"
+"    const arrows = {up:'\\u2197', down:'\\u2198', flat:'\\u2192'};\n"
+"    const snrCell = s ? `${s.current} dB <span class='snr-arrow snr-${s.trend}'>${arrows[s.trend]}</span>` : `<span class=muted>--</span>`;\n"
+"    tr.innerHTML=`<td>${hashHex}</td><td>${name}</td><td>${preset}</td><td>${c.total}</td><td>${decCell}</td><td>${slotCell}</td><td>${snrCell}</td><td>${fmtTime(c.ts)}</td>`;\n"
+"    frag.appendChild(tr);\n"
+"  }\n"
 "  chTbody.replaceChildren(frag);\n"
 "}\n"
 "function exportCsv(){\n"
@@ -650,6 +749,93 @@ static const char DASHBOARD_HTML[] =
 "  div.innerHTML = `<span class=ts>${fmtTime(ts||Date.now()/1000)}</span>${html}`;\n"
 "  el.insertBefore(div, el.firstChild);\n"
 "  while (el.children.length>200) el.removeChild(el.lastChild);\n"
+"}\n"
+/* msgSummary -- per-port short string for the global Messages pane.
+ * Returns null if the event should not appear in the pane (e.g. ATAK
+ * which already lands in Discoveries, or unknown ports with no
+ * useful summary). Keep each port to one tight line so the log
+ * stays readable when 100+ events scroll past. */
+"function msgSummary(p) {\n"
+"  const pn = p.port_name || '';\n"
+"  switch (pn) {\n"
+"    case 'TEXT_MESSAGE_APP':\n"
+"    case 'RANGE_TEST_APP':\n"
+"    case 'DETECTION_SENSOR_APP':\n"
+"      return p.text ? `<span class=text>${escHtml(p.text)}</span>` : null;\n"
+"    case 'NODEINFO_APP': {\n"
+"      const x = [];\n"
+"      if (p.long_name)  x.push(escHtml(p.long_name));\n"
+"      if (p.short_name) x.push('('+escHtml(p.short_name)+')');\n"
+"      if (p.hw_model!==undefined) x.push('hw='+p.hw_model);\n"
+"      if (p.role!==undefined)     x.push('role='+p.role);\n"
+"      return x.length ? x.join(' ') : null;\n"
+"    }\n"
+"    case 'POSITION_APP': {\n"
+"      const x = [];\n"
+"      if (typeof p.lat==='number' && typeof p.lon==='number')\n"
+"        x.push(`${p.lat.toFixed(5)},${p.lon.toFixed(5)}`);\n"
+"      if (p.alt_m!==undefined)    x.push(`alt=${p.alt_m}m`);\n"
+"      if (p.speed_mps!==undefined)x.push(`spd=${p.speed_mps}m/s`);\n"
+"      if (p.sats!==undefined)     x.push(`sats=${p.sats}`);\n"
+"      return x.length ? x.join(' ') : null;\n"
+"    }\n"
+"    case 'TELEMETRY_APP': {\n"
+"      const x = [];\n"
+"      const d = (p.device && p.device[0]) || {};\n"
+"      if (d.battery!==undefined) x.push(`bat=${d.battery}%`);\n"
+"      if (d.voltage!==undefined) x.push(`v=${d.voltage.toFixed(2)}`);\n"
+"      if (d.ch_util!==undefined) x.push(`chu=${d.ch_util.toFixed(1)}`);\n"
+"      if (d.uptime !==undefined) x.push(`up=${d.uptime}s`);\n"
+"      const e = (p.environment && p.environment[0]) || {};\n"
+"      if (e.temp_c   !==undefined) x.push(`t=${e.temp_c.toFixed(1)}C`);\n"
+"      if (e.humidity !==undefined) x.push(`rh=${e.humidity.toFixed(0)}%`);\n"
+"      if (e.pressure !==undefined) x.push(`p=${e.pressure.toFixed(0)}hPa`);\n"
+"      const ls = (p.local_stats && p.local_stats[0]) || {};\n"
+"      if (ls.nodes_online!==undefined) x.push(`online=${ls.nodes_online}`);\n"
+"      const aq = (p.air_quality && p.air_quality[0]) || {};\n"
+"      if (aq.pm25_std!==undefined) x.push(`pm25=${aq.pm25_std}`);\n"
+"      if (aq.co2_ppm !==undefined) x.push(`co2=${aq.co2_ppm}`);\n"
+"      return x.length ? x.join(' ') : null;\n"
+"    }\n"
+"    case 'WAYPOINT_APP': {\n"
+"      const x = [];\n"
+"      if (p.wp_name) x.push(escHtml(p.wp_name));\n"
+"      if (typeof p.lat==='number' && typeof p.lon==='number')\n"
+"        x.push(`${p.lat.toFixed(5)},${p.lon.toFixed(5)}`);\n"
+"      return x.length ? x.join(' ') : null;\n"
+"    }\n"
+"    case 'MAP_REPORT_APP': {\n"
+"      const x = [];\n"
+"      if (p.long_name) x.push(escHtml(p.long_name));\n"
+"      if (p.firmware)  x.push('fw='+escHtml(p.firmware));\n"
+"      if (p.region!==undefined) x.push('region='+p.region);\n"
+"      if (typeof p.lat==='number' && typeof p.lon==='number')\n"
+"        x.push(`${p.lat.toFixed(5)},${p.lon.toFixed(5)}`);\n"
+"      return x.length ? x.join(' ') : null;\n"
+"    }\n"
+"    case 'TRACEROUTE_APP':\n"
+"      return (p.route && p.route.length) ? `${p.route.length} hops` : null;\n"
+"    case 'NEIGHBORINFO_APP':\n"
+"      return (p.neighbors && p.neighbors.length) ? `${p.neighbors.length} neighbors` : null;\n"
+"    case 'ROUTING_APP':\n"
+"      return p.routing_kind || null;\n"
+"    case 'PAXCOUNTER_APP': {\n"
+"      const x = [];\n"
+"      if (p.pax_wifi!==undefined) x.push('wifi='+p.pax_wifi);\n"
+"      if (p.pax_ble !==undefined) x.push('ble=' +p.pax_ble);\n"
+"      return x.length ? x.join(' ') : null;\n"
+"    }\n"
+"    case 'STORE_FORWARD_APP':\n"
+"      return p.sf_rr || null;\n"
+"    case 'KEY_VERIFICATION_APP':\n"
+"    case 'REMOTE_HARDWARE_APP':\n"
+"    case 'ADMIN_APP':\n"
+"      return '\\u2014';\n"  /* en dash; show the row but no useful body */
+"    case 'ATAK_PLUGIN':\n"
+"      return null;\n"  /* ATAK already lands in Discoveries pane */
+"    default:\n"
+"      return null;\n"
+"  }\n"
 "}\n"
 "function updateTrail(id, ll){\n"
 "  if (!trails[id]) trails[id] = {pts:[], line:null};\n"
@@ -1106,6 +1292,405 @@ static const char DASHBOARD_HTML[] =
 "  if (!topoRafHandle) topoRafHandle = requestAnimationFrame(topoLoop);\n"
 "}\n"
 "function topoStop(){ topoActive = false; }\n"
+/* ---- Spectrum waterfall ----------------------------------------------- *
+ * Buffer the WATERFALL SSE rows and paint a scrolling time-vs-frequency
+ * canvas. Newest row at the top. One row per event (5 Hz by default).
+ * Buffer cap chosen for ~2 minutes of scrollback at 5 Hz (~600 rows).
+ * Colormap is an inline 32-stop viridis approximation -- close enough
+ * visually, ~1 KB of constants, no external assets. */
+"const SPEC_MAX_ROWS = 600;\n"
+"const specRows = [];\n"  /* each: Uint8Array(bin_count) */
+"let specBins = 0, specCenter = 0, specSpan = 0, specEncoding = '';\n"
+"let specDbMin = -10, specDbMax = 50;\n"
+"let specRate = 0, specLastTs = 0, specRateSmoothed = 0, specFrozenLastTs = 0;\n"
+"let specActive = false, specPaused = false, specDirty = false;\n"
+"let specRaf = 0, specOffscreen = null, specOffscreenRows = 0;\n"
+// Rows of scrollback from the live tail. Wheel bumps it while paused.
+"let specScrollOffset = 0;\n"
+"const specCanvas = document.getElementById('spec-canvas');\n"
+"const specCtx = specCanvas.getContext('2d');\n"
+/* 32-stop viridis approximation. Indexed by (byte >> 3). Keeps the
+ * palette monotonic in perceptual brightness so signal-vs-noise pops
+ * the way a thermal scale does without inventing a red 'alarm' color. */
+"const VIRIDIS = [\n"
+"  [68,1,84],[71,16,99],[72,29,111],[71,42,122],[69,55,129],[64,67,135],\n"
+"  [59,80,139],[54,92,141],[49,104,142],[44,114,142],[39,125,142],[35,135,141],\n"
+"  [31,146,140],[30,156,137],[33,167,133],[42,177,126],[58,187,118],[81,197,106],\n"
+"  [108,205,90],[138,213,71],[170,220,50],[202,225,31],[233,228,26],[253,231,37],\n"
+"  [253,231,37],[253,231,37],[253,231,37],[253,231,37],\n"
+"  [253,231,37],[253,231,37],[253,231,37],[253,231,37]];\n"
+"function specEnsureOffscreen(){\n"
+"  /* Offscreen canvas holds the row history in a directly-blittable\n"
+"   * pixel grid (bins-wide, SPEC_MAX_ROWS tall). We blit-copy-up on\n"
+"   * each new row and draw the new row at y=0. Painting the screen\n"
+"   * canvas is then one drawImage scaled to the visible area -- way\n"
+"   * cheaper than per-row fillRect at 5 Hz with 1024 bins. */\n"
+"  if (!specBins) return false;\n"
+"  if (!specOffscreen || specOffscreen.width !== specBins) {\n"
+"    specOffscreen = document.createElement('canvas');\n"
+"    specOffscreen.width = specBins;\n"
+"    specOffscreen.height = SPEC_MAX_ROWS;\n"
+"    specOffscreenRows = 0;\n"
+"  }\n"
+"  return true;\n"
+"}\n"
+"function specPutRow(row){\n"
+"  if (!specEnsureOffscreen()) return;\n"
+"  const octx = specOffscreen.getContext('2d');\n"
+"  /* Scroll the offscreen down by 1 px so the freshly painted row at\n"
+"   * y=0 displaces the oldest row off the bottom. drawImage with\n"
+"   * source==dest is well-defined when the source rect is fully\n"
+"   * covered, which it is here. */\n"
+"  octx.drawImage(specOffscreen, 0, 0, specBins, SPEC_MAX_ROWS - 1, 0, 1, specBins, SPEC_MAX_ROWS - 1);\n"
+"  const img = octx.createImageData(specBins, 1);\n"
+"  for (let i = 0; i < specBins; ++i) {\n"
+"    const c = VIRIDIS[row[i] >> 3];\n"
+"    const o = i * 4;\n"
+"    img.data[o]   = c[0];\n"
+"    img.data[o+1] = c[1];\n"
+"    img.data[o+2] = c[2];\n"
+"    img.data[o+3] = 255;\n"
+"  }\n"
+"  octx.putImageData(img, 0, 0);\n"
+"  if (specOffscreenRows < SPEC_MAX_ROWS) specOffscreenRows++;\n"
+"  specDirty = true;\n"
+"}\n"
+"function onWaterfall(p){\n"
+"  /* First-row plumbing: surface the tab in the nav, latch the\n"
+"   * frequency span / encoding / db range so the strip can label\n"
+"   * itself. Doing it on every row would be wasteful; the source\n"
+"   * sensor's config doesn't change mid-run. */\n"
+"  if (specBins === 0) {\n"
+"    specBins = p.bin_count|0;\n"
+"    specCenter = +p.f_center_hz || 0;\n"
+"    specSpan = +p.f_span_hz || 0;\n"
+"    specEncoding = p.encoding || '';\n"
+"    if (typeof p.db_min === 'number') specDbMin = p.db_min;\n"
+"    if (typeof p.db_max === 'number') specDbMax = p.db_max;\n"
+"    const btn = document.getElementById('tab-spectrum');\n"
+"    if (btn) btn.style.display = '';\n"
+"    const lo = (specCenter - specSpan/2) / 1e6;\n"
+"    const hi = (specCenter + specSpan/2) / 1e6;\n"
+"    const rg = document.getElementById('spec-range');\n"
+"    if (rg) rg.textContent = `${lo.toFixed(3)} - ${hi.toFixed(3)} MHz`;\n"
+"  }\n"
+"  if (specLastTs > 0 && p.ts > specLastTs) {\n"
+"    const inst = 1.0 / (p.ts - specLastTs);\n"
+"    /* 1-tap EMA so the displayed rate isn't jumpy under transient\n"
+"     * SSE-flush stalls. 5 Hz nominal -> readout settles within a\n"
+"     * second. */\n"
+"    specRateSmoothed = specRateSmoothed === 0 ? inst : (0.7 * specRateSmoothed + 0.3 * inst);\n"
+"    specRate = specRateSmoothed;\n"
+"  }\n"
+"  specLastTs = p.ts;\n"
+"  if (specPaused) return;\n"
+"  /* Decode base64 -> Uint8Array(bin_count). Browser-native atob is\n"
+"   * fine for our 1366-byte payloads at 5 Hz. */\n"
+"  const raw = atob(p.bins || '');\n"
+"  const n = Math.min(specBins, raw.length);\n"
+"  const row = new Uint8Array(n);\n"
+"  for (let i = 0; i < n; ++i) row[i] = raw.charCodeAt(i);\n"
+"  specRows.push(row);\n"
+"  if (specRows.length > SPEC_MAX_ROWS) specRows.shift();\n"
+"  specPutRow(row);\n"
+"}\n"
+"function spectrumPaint(){\n"
+"  specRaf = 0;\n"
+"  if (!specActive) return;\n"
+"  if (specDirty && specOffscreen) {\n"
+"    /* Setting .width/.height always clears the bitmap, even when the\n"
+"     * value is unchanged -- gate on actual mismatch so most frames\n"
+"     * don't pay the reset. */\n"
+"    if (specCanvas.width !== specCanvas.clientWidth) specCanvas.width = specCanvas.clientWidth;\n"
+"    if (specCanvas.height !== specCanvas.clientHeight) specCanvas.height = specCanvas.clientHeight;\n"
+"    specCtx.imageSmoothingEnabled = false;\n"
+"    // One shared display geometry for the offscreen blit, time labels,\n"
+"    // and overlay placement -- otherwise the stretched scrollback\n"
+"    // pixels would drift relative to the box positions.\n"
+"    const srcY = Math.max(0, Math.min(specOffscreenRows - 1, specScrollOffset|0));\n"
+"    const displayRows = Math.max(1, specOffscreenRows - srcY);\n"
+"    const H = specCanvas.height - 16;\n"
+"    const pxPerRow = H / displayRows;\n"
+"    specCtx.drawImage(specOffscreen, 0, srcY, specBins, displayRows, 0, 0, specCanvas.width, H);\n"
+"    /* Bottom-edge MHz labels: 5 ticks across the visible canvas. */\n"
+"    if (specSpan > 0) {\n"
+"      specCtx.fillStyle = 'rgba(15,23,42,0.7)';\n"
+"      specCtx.fillRect(0, specCanvas.height - 16, specCanvas.width, 16);\n"
+"      specCtx.fillStyle = '#cbd5e1';\n"
+"      specCtx.font = '10px sans-serif';\n"
+"      for (let t = 0; t <= 4; ++t) {\n"
+"        const fx = t / 4;\n"
+"        const mhz = ((specCenter - specSpan/2) + fx * specSpan) / 1e6;\n"
+"        const x = Math.round(fx * (specCanvas.width - 1));\n"
+"        const label = mhz.toFixed(3) + ' MHz';\n"
+"        const tw = specCtx.measureText(label).width;\n"
+"        let lx = x - tw / 2;\n"
+"        if (lx < 2) lx = 2;\n"
+"        if (lx + tw > specCanvas.width - 2) lx = specCanvas.width - 2 - tw;\n"
+"        specCtx.fillText(label, lx, specCanvas.height - 4);\n"
+"      }\n"
+"    }\n"
+"    // refTs locks overlays to the frozen pixel grid while paused;\n"
+"    // also drives the Y-axis time labels below.\n"
+"    const refTs = specFrozenLastTs > 0 ? specFrozenLastTs : specLastTs;\n"
+"    // Y-axis time labels every ~10 s; tsTop is the top row's\n"
+"    // wall-clock and slides with scrollback via srcY.\n"
+"    if (specRate > 0 && refTs > 0) {\n"
+"      const tsTop = refTs - srcY / specRate;\n"
+"      const rowsPerTick = Math.max(1, Math.round(10 * specRate));\n"
+"      specCtx.font = '10px sans-serif';\n"
+"      for (let row = 0; row < displayRows; row += rowsPerTick) {\n"
+"        const y = Math.round(row * pxPerRow);\n"
+"        if (y < 12 || y > H - 4) continue;\n"
+"        const d = new Date((tsTop - row / specRate) * 1000);\n"
+"        const lbl = d.toLocaleTimeString();\n"
+"        specCtx.fillStyle = 'rgba(15,23,42,0.65)';\n"
+"        specCtx.fillRect(0, y - 9, 64, 12);\n"
+"        specCtx.fillStyle = '#cbd5e1';\n"
+"        specCtx.fillText(lbl, 4, y);\n"
+"      }\n"
+"    }\n"
+"    // Color legend: tiny viridis strip top-right + db_min/db_max labels.\n"
+"    {\n"
+"      const lgW = 10, lgH = 80, lgX = specCanvas.width - lgW - 6, lgY = 8;\n"
+"      for (let py = 0; py < lgH; ++py) {\n"
+"        const v = 255 - Math.round((py / (lgH - 1)) * 255);\n"
+"        const c = VIRIDIS[v >> 3];\n"
+"        specCtx.fillStyle = `rgb(${c[0]},${c[1]},${c[2]})`;\n"
+"        specCtx.fillRect(lgX, lgY + py, lgW, 1);\n"
+"      }\n"
+"      specCtx.fillStyle = '#cbd5e1';\n"
+"      specCtx.font = '10px sans-serif';\n"
+"      const topLab = `+${specDbMax}`, botLab = `${specDbMin}`;\n"
+"      const topW = specCtx.measureText(topLab).width;\n"
+"      const botW = specCtx.measureText(botLab).width;\n"
+"      specCtx.fillText(topLab, lgX - topW - 3, lgY + 8);\n"
+"      specCtx.fillText(botLab, lgX - botW - 3, lgY + lgH);\n"
+"      specCtx.fillText('dB', lgX - 14, lgY + lgH / 2 + 4);\n"
+"    }\n"
+"    // Decoded-packet overlay: X from freq_hz/bw_hz, Y from ts vs row\n"
+"    // rate, fixed ~6-row box height (airtime sizing is v1.5).\n"
+"    if (specOverlays.length && specRate > 0 && refTs > 0 && specOffscreenRows > 0) {\n"
+"      const W = specCanvas.width;\n"
+"      const boxHeightPx = Math.max(4, Math.round(6 * pxPerRow));\n"
+"      const fLow = specCenter - specSpan / 2;\n"
+"      // Prune anything older than TTL so the loop is O(visible).\n"
+"      while (specOverlays.length && (refTs - specOverlays[0].ts) > SPEC_OVERLAY_TTL) {\n"
+"        specOverlays.shift();\n"
+"      }\n"
+"      specCtx.lineWidth = 1.0;\n"
+"      const labelStart = Math.max(0, specOverlays.length - SPEC_OVERLAY_LABEL_COUNT);\n"
+"      for (let i = 0; i < specOverlays.length; ++i) {\n"
+"        const ov = specOverlays[i];\n"
+"        const ageRows = (refTs - ov.ts) * specRate - srcY;\n"
+"        if (ageRows < 0) continue;\n"
+"        if (ageRows >= displayRows) continue;\n"
+"        const yTop = Math.round(ageRows * pxPerRow);\n"
+"        const xLo = Math.round(((ov.fLo - fLow) / specSpan) * (W - 1));\n"
+"        const xHi = Math.round(((ov.fHi - fLow) / specSpan) * (W - 1));\n"
+"        if (xHi < 0 || xLo >= W) continue;\n"
+"        const xL = Math.max(0, xLo);\n"
+"        const xR = Math.min(W - 1, xHi);\n"
+"        const boxW = Math.max(2, xR - xL);\n"
+"        specCtx.strokeStyle = ov.color;\n"
+"        specCtx.strokeRect(xL + 0.5, yTop + 0.5, boxW, boxHeightPx);\n"
+"        if (i >= labelStart && ov.label) {\n"
+"          const ageSec = refTs - ov.ts;\n"
+"          const alpha = Math.max(0.0, 1.0 - ageSec / SPEC_OVERLAY_LABEL_FADE);\n"
+"          if (alpha > 0) {\n"
+"            specCtx.font = '10px sans-serif';\n"
+"            const tw = specCtx.measureText(ov.label).width;\n"
+"            let tx = xL;\n"
+"            if (tx + tw > W - 2) tx = W - 2 - tw;\n"
+"            const ty = Math.min(H - 2, yTop + boxHeightPx + 11);\n"
+"            specCtx.fillStyle = `rgba(15,23,42,${(0.7 * alpha).toFixed(2)})`;\n"
+"            specCtx.fillRect(tx - 2, ty - 9, tw + 4, 11);\n"
+"            specCtx.fillStyle = `rgba(226,232,240,${alpha.toFixed(2)})`;\n"
+"            specCtx.fillText(ov.label, tx, ty);\n"
+"          }\n"
+"        }\n"
+"      }\n"
+"    }\n"
+"    specDirty = false;\n"
+"  }\n"
+"  if (specRate > 0) {\n"
+"    const r = document.getElementById('spec-rate');\n"
+"    if (r) r.textContent = specRate.toFixed(1);\n"
+"  }\n"
+"  specRaf = requestAnimationFrame(spectrumPaint);\n"
+"}\n"
+"function spectrumStart(){\n"
+"  specActive = true;\n"
+"  specDirty = true;\n"
+"  if (!specRaf) specRaf = requestAnimationFrame(spectrumPaint);\n"
+"}\n"
+"function spectrumStop(){\n"
+"  specActive = false;\n"
+"  if (specRaf) { cancelAnimationFrame(specRaf); specRaf = 0; }\n"
+"}\n"
+"function toggleSpectrumPause(){\n"
+"  specPaused = !specPaused;\n"
+"  // Snapshot keeps overlays locked to the frozen pixel grid.\n"
+"  specFrozenLastTs = specPaused ? specLastTs : 0;\n"
+"  if (!specPaused) {\n"
+"    specScrollOffset = 0;\n"
+"    specTipEl.style.display = 'none';\n"
+"    specWrapEl.classList.remove('over-box');\n"
+"  }\n"
+"  const b = document.getElementById('spec-pause');\n"
+"  const s = document.getElementById('spec-pause-status');\n"
+"  if (b) { b.textContent = specPaused ? 'Resume' : 'Pause'; b.classList.toggle('on', specPaused); }\n"
+"  if (s) s.textContent = specPaused ? (specScrollOffset ? `paused -${specScrollOffset}r` : 'paused') : '';\n"
+"  specWrapEl.classList.toggle('scroll', specPaused);\n"
+"  specDirty = true;\n"
+"}\n"
+"window.addEventListener('resize', ()=>{ if (specActive) specDirty = true; });\n"
+// Wheel scrollback is paused-only so live mode can't be snapped off
+// its tail by a stray trackpad scroll. Three rows per notch ~= one
+// SF9 airtime.
+"specCanvas.addEventListener('wheel', e => {\n"
+"  if (!specPaused) return;\n"
+"  e.preventDefault();\n"
+"  const step = (e.deltaY > 0 ? 3 : -3);\n"
+"  specScrollOffset = Math.max(0, Math.min(SPEC_MAX_ROWS - 1, specScrollOffset + step));\n"
+"  const s = document.getElementById('spec-pause-status');\n"
+"  if (s) s.textContent = specScrollOffset ? `paused -${specScrollOffset}r` : 'paused';\n"
+"  specDirty = true;\n"
+"}, {passive: false});\n"
+// Hover tooltip: hit-test against overlay list, compact summary +
+// full JSON. Newest-first so a fresh box wins over older overlap.
+"const specTipEl = document.getElementById('spec-tip');\n"
+"const specWrapEl = document.getElementById('spec-wrap');\n"
+"function specHoverFmt(ov){\n"
+"  const r = ov.raw || {};\n"
+"  const fmhz = r.freq_hz ? (r.freq_hz/1e6).toFixed(3) + ' MHz' :\n"
+"              r.f_hz    ? (r.f_hz/1e6).toFixed(3) + ' MHz' : '?';\n"
+"  const bwk  = r.bw_hz ? (r.bw_hz/1000).toFixed(0) + ' kHz' :\n"
+"              r.bw_estimate_hz ? '~' + (r.bw_estimate_hz/1000).toFixed(0) + ' kHz' : '';\n"
+"  let head, kind;\n"
+"  if (r.event === 'OFF_GRID_LORA') {\n"
+"    head = `<span class=hd>OFF-GRID DISCOVERY</span>`;\n"
+"    kind = `${fmhz} ${bwk}  SNR ${r.snr_db !== undefined ? r.snr_db.toFixed(1) : '?'} dB`;\n"
+"  } else {\n"
+"    const arrow = r.to ? ` -> ${r.to}` : '';\n"
+"    head = `<span class=hd>${r.from || '?'}${arrow}</span>`;\n"
+"    const preset = r.preset || '?';\n"
+"    const sf = (r.sf !== undefined) ? `SF${r.sf}` : '';\n"
+"    const cr = (r.cr !== undefined) ? `CR4/${r.cr}` : '';\n"
+"    const snr = (r.snr_db !== undefined) ? `SNR ${r.snr_db.toFixed(1)} dB` : '';\n"
+"    let trust;\n"
+"    if (r.decrypted) trust = `<span class=ok>decrypted</span>`;\n"
+"    else if (r.payload_crc_ok === false) trust = `<span class=bad>CRC FAIL</span>`;\n"
+"    else if (r.fields_trusted === false) trust = `<span class=bad>no CRC, not decrypted</span>`;\n"
+"    else trust = `untrusted`;\n"
+"    kind = `${preset} ${sf} ${cr} @ ${fmhz} ${bwk}\\n${snr}  ${trust}`;\n"
+"    if (r.channel_name) kind += `\\nchannel ${r.channel_name}` + (r.channel_hash !== undefined ? ` (hash ${r.channel_hash})` : '');\n"
+"    if (r.port_name)    kind += `  ${r.port_name}`;\n"
+"    if (r.hop_limit !== undefined && r.hop_start !== undefined)\n"
+"      kind += `\\nhop ${r.hop_limit}/${r.hop_start}` + (r.relay_node !== undefined ? `  via relay ${r.relay_node}` : '');\n"
+"    if (r.via_mqtt) kind += `  via_mqtt`;\n"
+"  }\n"
+"  const json = JSON.stringify(r, null, 1);\n"
+"  return `${head}\\n${kind}<pre>${json.replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]))}</pre>`;\n"
+"}\n"
+"specCanvas.addEventListener('mousemove', e => {\n"
+"  if (!specOverlays.length || specRate <= 0 || specOffscreenRows <= 0) {\n"
+"    specTipEl.style.display = 'none';\n"
+"    specWrapEl.classList.remove('over-box');\n"
+"    return;\n"
+"  }\n"
+"  const rect = specCanvas.getBoundingClientRect();\n"
+"  const mx = e.clientX - rect.left;\n"
+"  const my = e.clientY - rect.top;\n"
+"  const refTs = specFrozenLastTs > 0 ? specFrozenLastTs : specLastTs;\n"
+"  const W = specCanvas.width;\n"
+"  const H = specCanvas.height - 16;\n"
+"  // Mirror the paint path's display geometry so the hit-test sits on\n"
+"  // the same pixels the user sees, scrollback included.\n"
+"  const srcY = Math.max(0, Math.min(specOffscreenRows - 1, specScrollOffset|0));\n"
+"  const displayRows = Math.max(1, specOffscreenRows - srcY);\n"
+"  const pxPerRow = H / displayRows;\n"
+"  const boxHeightPx = Math.max(4, Math.round(6 * pxPerRow));\n"
+"  const fLow = specCenter - specSpan / 2;\n"
+"  let hit = null;\n"
+"  for (let i = specOverlays.length - 1; i >= 0; --i) {\n"
+"    const ov = specOverlays[i];\n"
+"    const ageRows = (refTs - ov.ts) * specRate - srcY;\n"
+"    if (ageRows < 0 || ageRows >= displayRows) continue;\n"
+"    const yTop = Math.round(ageRows * pxPerRow);\n"
+"    if (my < yTop || my > yTop + boxHeightPx) continue;\n"
+"    const xLo = Math.round(((ov.fLo - fLow) / specSpan) * (W - 1));\n"
+"    const xHi = Math.round(((ov.fHi - fLow) / specSpan) * (W - 1));\n"
+"    if (mx < xLo || mx > xHi) continue;\n"
+"    hit = ov; break;\n"
+"  }\n"
+"  if (!hit) { specTipEl.style.display = 'none'; specWrapEl.classList.remove('over-box'); return; }\n"
+"  specWrapEl.classList.add('over-box');\n"
+"  specTipEl.innerHTML = specHoverFmt(hit);\n"
+"  // Position near cursor, flipped away from edges so it stays in view.\n"
+"  const wrapRect = specWrapEl.getBoundingClientRect();\n"
+"  const px = e.clientX - wrapRect.left + 12;\n"
+"  const py = e.clientY - wrapRect.top + 12;\n"
+"  specTipEl.style.display = 'block';\n"
+"  const tipW = specTipEl.offsetWidth, tipH = specTipEl.offsetHeight;\n"
+"  specTipEl.style.left = Math.min(wrapRect.width - tipW - 6, px) + 'px';\n"
+"  specTipEl.style.top  = Math.min(wrapRect.height - tipH - 6, py) + 'px';\n"
+"});\n"
+"specCanvas.addEventListener('mouseleave', () => { specTipEl.style.display = 'none'; specWrapEl.classList.remove('over-box'); });\n"
+/* ---- Decoded-packet overlay -------------------------------------------- *
+ * Boxes get a 60 s lifetime: anything older has scrolled off the buffer
+ * anyway, so keeping them around just costs paint. Labels are reserved
+ * for the newest few entries to keep a busy mesh readable. */
+"const SPEC_OVERLAY_MAX = 200;\n"
+"const SPEC_OVERLAY_TTL = 60.0;\n"
+"const SPEC_OVERLAY_LABEL_COUNT = 4;\n"
+"const SPEC_OVERLAY_LABEL_FADE = 30.0;\n"
+"const specOverlays = [];\n"  /* each: {ts, fLo, fHi, color, label} */
+"function specPushOverlay(ev){\n"
+"  /* Drop the overlay if we don't yet know the spectrum geometry --\n"
+"   * the box has no meaningful X range without a center/span. */\n"
+"  if (specSpan <= 0 || specBins === 0) return;\n"
+"  const fc = +ev.freq_hz; if (!fc) return;\n"
+"  const bw = +ev.bw_hz || 250000;\n"
+"  let color = 'rgba(34,197,94,0.95)';\n"  /* green: CRC-pass / trusted */
+"  if (ev.event === 'OFF_GRID_LORA') {\n"
+"    color = 'rgba(168,85,247,0.95)';\n"   /* purple */
+"  } else if (ev.payload_crc_ok === false || ev.fields_trusted === false) {\n"
+"    color = 'rgba(245,158,11,0.95)';\n"   /* amber: CRC-fail / untrusted */
+"  }\n"
+"  let label = '';\n"
+"  if (ev.event === 'OFF_GRID_LORA') {\n"
+"    label = `off-grid ${(fc/1e6).toFixed(3)} MHz`;\n"
+"  } else {\n"
+"    const from = ev.from || '?';\n"
+"    const ch   = ev.channel_name || '';\n"
+"    const sf   = (typeof ev.sf === 'number') ? ('SF' + ev.sf) : '';\n"
+"    const snr  = (typeof ev.snr_db === 'number') ? (ev.snr_db.toFixed(0) + 'dB') : '';\n"
+"    label = [from, ch, sf, snr].filter(Boolean).join(' ');\n"
+"  }\n"
+"  /* Anchor Y placement to preamble lock when available -- that's\n"
+"   * the chirp START. ev.ts is the decode-emission time, which sits\n"
+"   * one full airtime later and would float the box up off the\n"
+"   * row its energy actually painted on. preamble_lock_t_ns is\n"
+"   * stamped at the moment of preamble lock, in nanoseconds. */\n"
+"  let anchor = +ev.ts || (Date.now() / 1000);\n"
+"  if (typeof ev.preamble_lock_t_ns === 'number' && ev.preamble_lock_t_ns > 0) {\n"
+"    anchor = ev.preamble_lock_t_ns / 1e9;\n"
+"  }\n"
+"  // Cache the dashboard-relevant event fields so the hover tooltip\n"
+"  // has them; full payloads (device telemetry, position) are dropped\n"
+"  // to keep the overlay array bounded.\n"
+"  const rawKeep = ['event','from','to','packet_id','channel_hash','channel_name','sf','cr','bw_hz','freq_hz','preset','snr_db','cfo_hz','payload_crc_ok','fields_trusted','decrypted','hop_limit','hop_start','relay_node','portnum','port_name','via_mqtt','want_ack','bw_estimate_hz','f_hz','preamble_lock_t_ns'];\n"
+"  const raw = {};\n"
+"  for (const k of rawKeep) if (ev[k] !== undefined) raw[k] = ev[k];\n"
+"  specOverlays.push({\n"
+"    ts:    anchor,\n"
+"    fLo:   fc - bw / 2,\n"
+"    fHi:   fc + bw / 2,\n"
+"    color, label, raw });\n"
+"  while (specOverlays.length > SPEC_OVERLAY_MAX) specOverlays.shift();\n"
+"  specDirty = true;\n"
+"}\n"
 "window.addEventListener('resize', ()=>{ if (topoActive) topoSize(); });\n"
 "topoCanvas.addEventListener('mousemove', e=>{\n"
 "  const rect = topoCanvas.getBoundingClientRect();\n"
@@ -1132,6 +1717,46 @@ static const char DASHBOARD_HTML[] =
 "      document.getElementById('st-offgrid-wrap').style.display = '';\n"
 "      setStat('st-offgrid', fmtCount(p.off_grid));\n"
 "    }\n"
+"    // Focus pool summary: hide entirely when --deep-decode=off so the\n"
+"    // bar stays compact for users who haven't enabled it.\n"
+"    if (p.focus_active === true) {\n"
+"      const w = p.focus_workers||0;\n"
+"      const prom = p.focus_promotions||0;\n"
+"      const drop = p.focus_dropped||0;\n"
+"      const below = p.focus_below_snr||0;\n"
+"      const fr = p.focus_frames||0;\n"
+"      document.getElementById('st-focus-wrap').style.display = '';\n"
+"      // Compact: 'Nw / Pprom / Ddrop / Bsnr / Ffr' -- expand on hover via title.\n"
+"      setStat('st-focus', `${w}w ${fmtCount(prom)}p ${fmtCount(drop)}d ${fmtCount(below)}s ${fmtCount(fr)}f`);\n"
+"    }\n"
+"    // Clock discipline class. Hidden until first STATS so we don't\n"
+"    // flash 'NTP' on a station that hasn't reported yet.\n"
+"    if (p.clock) {\n"
+"      document.getElementById('st-clock-wrap').style.display = '';\n"
+"      const accNs = p.clock_acc_ns;\n"
+"      let accLabel = '';\n"
+"      if (typeof accNs === 'number') {\n"
+"        if (accNs >= 1e6) accLabel = ` (${(accNs/1e6).toFixed(0)} ms)`;\n"
+"        else if (accNs >= 1e3) accLabel = ` (${(accNs/1e3).toFixed(0)} us)`;\n"
+"        else accLabel = ` (${accNs} ns)`;\n"
+"      }\n"
+"      setStat('st-clock', p.clock + accLabel);\n"
+"    }\n"
+"    return;\n"
+"  }\n"
+"  if (p.event === 'CHAN_SNR') {\n"
+/* Per-slot SNR sparkline updates. Each entry is {id, snr:[60 ints,
+ * -1 for empty bucket, otherwise rounded dB]}. Store keyed by slot id;
+ * renderChannels() aggregates across the slots that share a channel
+ * hash because the Channels table groups by hash. */
+"    if (Array.isArray(p.channels)) {\n"
+"      for (const c of p.channels) chanSnr[c.id] = c.snr;\n"
+"      refreshChannels();\n"
+"    }\n"
+"    return;\n"
+"  }\n"
+"  if (p.event === 'WATERFALL') {\n"
+"    onWaterfall(p);\n"
 "    return;\n"
 "  }\n"
 "  if (p.event === 'OFF_GRID_LORA') {\n"
@@ -1144,9 +1769,24 @@ static const char DASHBOARD_HTML[] =
 "    const sf = 11; const cr = 5; // sensible defaults; user can override later\n"
 "    const promoteBtn = `<button class=promote data-f=\"${p.f_hz}\" data-bw=\"${bwGuess}\" data-sf=\"${sf}\" data-cr=\"${cr}\">promote</button>`;\n"
 "    pushTo(discEl, `<span class=disc>off-grid: ${(p.f_hz/1e6).toFixed(3)} MHz, SNR ${p.snr_db.toFixed(1)} dB, ~${(bwGuess/1000).toFixed(0)} kHz</span> ${promoteBtn}`, p.ts);\n"
+"    /* Purple box on the Spectrum tab so the operator can correlate\n"
+"     * the alert with actual RF energy. */\n"
+"    // Purple box describes what the scanner actually saw; bwGuess\n"
+"    // is only for the Promote button (which has to quantize to a\n"
+"    // valid LoRa BW). Carry bw_estimate_hz through so the tooltip\n"
+"    // can show the raw value too.\n"
+"    const bwOverlay = p.bw_estimate_hz || bwGuess;\n"
+"    specPushOverlay({ event:'OFF_GRID_LORA', ts:p.ts, freq_hz:p.f_hz,\n"
+"                      bw_hz:bwOverlay, bw_estimate_hz:p.bw_estimate_hz });\n"
 "    return;\n"
 "  }\n"
 "  if (!p.from) return;\n"
+"  /* Decoded-packet overlay on the Spectrum tab. We register before\n"
+"   * the trust filter so amber boxes for CRC-fail/untrusted frames\n"
+"   * still appear -- the operator's question 'did the decoder see\n"
+"   * that blob?' is the whole point of the overlay, and CRC-fail\n"
+"   * sightings are legitimate decoder output, just not trusted bytes. */\n"
+"  if (p.freq_hz) specPushOverlay(p);\n"
 "  // Station-self marker on the live map (when --gpsd is running).\n"
 "  if (p.station_lat !== undefined && p.station_lon !== undefined) {\n"
 "    noteStation(p.station_lat, p.station_lon, p.station_alt_m);\n"
@@ -1227,7 +1867,13 @@ static const char DASHBOARD_HTML[] =
 "    }\n"
 "  }\n"
 "  if (Math.random() < 0.05) topoPrune();\n"
-"  if (p.text) pushTo(msgsEl, `<b>${n.name||id}</b> <span class=muted>${p.channel_name||''}</span>: <span class=text>${p.text}</span>`, p.ts);\n"
+"  // Slot ids 1019..1023 are focused-pool / manual-focus workers (see\n"
+"  // CHANNELIZER_MAX_CHANNELS in channelizer.h); flag those so the\n"
+"  // operator can tell which frames the deep-decode path delivered.\n"
+"  const focusedBadge = (typeof p.slot_id === 'number' && p.slot_id >= 1019)\n"
+"    ? '<span class=muted style=\"color:#38bdf8\">[focused]</span> ' : '';\n"
+"  const summary = msgSummary(p);\n"
+"  if (summary) pushTo(msgsEl, `${focusedBadge}<b>${n.name||id}</b> <span class=muted>${p.channel_name||''}</span> <span class=port>${p.port_name||''}</span>: ${summary}`, p.ts);\n"
 "  if (p.atak_callsign) pushTo(discEl, `<span class=atak>ATAK ${p.atak_callsign} (${p.atak_team}/${p.atak_role})${p.atak_chat?' chat: '+p.atak_chat:''}</span>`, p.ts);\n"
 "  noteNodeFrame(id, p);\n"
 "  evictNodes();\n"
@@ -1415,11 +2061,41 @@ static int b64v(char c) {
 /* meshtastic.org/e/ URLs are of the form:
  *   meshtastic.org/e/?#CgUYAyIBAQ           (single-channel base64-url)
  *   meshtastic.org/e/?#CHANNELSET=BASE64URL (also seen)
- * The base64-url payload is a protobuf ChannelSet { Channel channels = 1 }
- * where each Channel has a settings { name, psk } sub-message.
+ * The base64-url payload is a protobuf ChannelSet { Channel channels = 1 }.
+ *
+ *   Channel { int32 index = 1; ChannelSettings settings = 2; Role role = 3; }
+ *   ChannelSettings { uint32 channel_num = 1 [deprecated];
+ *                     bytes psk = 2; string name = 3; ... }
  *
  * For each channel found, calls keyset_add(name, psk_bytes, psk_len).
  * Returns the number of channels added, or -1 on parse error. */
+static int share_skip(const uint8_t **pp, const uint8_t *end, uint32_t wt)
+{
+    const uint8_t *p = *pp;
+    if (wt == 0) {
+        while (p < end && (*p++ & 0x80)) {}
+    } else if (wt == 1) {
+        if (end - p < 8) return -1;
+        p += 8;
+    } else if (wt == 2) {
+        uint64_t l = 0; int sh = 0;
+        while (p < end) {
+            uint8_t b = *p++;
+            l |= (uint64_t)(b & 0x7f) << sh;
+            if (!(b & 0x80)) break;
+            sh += 7;
+        }
+        if ((uint64_t)(end - p) < l) return -1;
+        p += (size_t)l;
+    } else if (wt == 5) {
+        if (end - p < 4) return -1;
+        p += 4;
+    } else {
+        return -1;
+    }
+    *pp = p;
+    return 0;
+}
 /* Public wrapper so main.c can use the same decoder for --share-url. */
 int web_decode_share_url(keyset_t *ks, const char *url) { extern int decode_channel_share(keyset_t *, const char *); return decode_channel_share(ks, url); }
 
@@ -1482,7 +2158,7 @@ int decode_channel_share(keyset_t *ks, const char *url_or_b64)
 
             if (fld != 1) continue;  /* not a Channel */
 
-            /* Parse Channel: look for field 1 (settings) submessage. */
+            /* Parse Channel: look for field 2 (settings) submessage. */
             uint8_t  psk[32]; size_t psk_len = 0;
             char     name[32]; name[0] = 0;
             while (cp < cend) {
@@ -1495,7 +2171,10 @@ int decode_channel_share(keyset_t *ks, const char *url_or_b64)
                 }
                 uint32_t f2 = (uint32_t)(t2 >> 3);
                 uint32_t w2 = (uint32_t)(t2 & 0x7);
-                if (w2 != 2) continue;
+                if (f2 != 2 || w2 != 2) {
+                    if (share_skip(&cp, cend, w2) < 0) break;
+                    continue;
+                }
                 uint64_t l2 = 0; s2 = 0;
                 while (cp < cend) {
                     uint8_t b = *cp++;
@@ -1505,9 +2184,8 @@ int decode_channel_share(keyset_t *ks, const char *url_or_b64)
                 }
                 if ((uint64_t)(cend - cp) < l2) break;
                 const uint8_t *sp = cp; const uint8_t *send = cp + l2; cp += l2;
-                if (f2 != 1) continue;     /* not the settings sub-message */
 
-                /* Parse ChannelSettings: field 1 = psk (bytes), field 2 = name (string). */
+                /* Parse ChannelSettings: field 2 = psk (bytes), field 3 = name (string). */
                 while (sp < send) {
                     uint64_t t3 = 0; int s3 = 0;
                     while (sp < send) {
@@ -1518,7 +2196,10 @@ int decode_channel_share(keyset_t *ks, const char *url_or_b64)
                     }
                     uint32_t f3 = (uint32_t)(t3 >> 3);
                     uint32_t w3 = (uint32_t)(t3 & 0x7);
-                    if (w3 != 2) continue;
+                    if (w3 != 2) {
+                        if (share_skip(&sp, send, w3) < 0) break;
+                        continue;
+                    }
                     uint64_t l3 = 0; s3 = 0;
                     while (sp < send) {
                         uint8_t b = *sp++;
@@ -1527,9 +2208,9 @@ int decode_channel_share(keyset_t *ks, const char *url_or_b64)
                         s3 += 7;
                     }
                     if ((uint64_t)(send - sp) < l3) break;
-                    if (f3 == 1 && l3 <= sizeof(psk)) {   /* psk */
+                    if (f3 == 2 && l3 <= sizeof(psk)) {        /* psk */
                         memcpy(psk, sp, l3); psk_len = (size_t)l3;
-                    } else if (f3 == 2 && l3 < sizeof(name)) {
+                    } else if (f3 == 3 && l3 < sizeof(name)) { /* name */
                         memcpy(name, sp, l3); name[l3] = 0;
                     }
                     sp += l3;
@@ -1728,20 +2409,38 @@ void web_init(int port)
 void web_publish_line(const char *json, size_t len)
 {
     if (!json || len == 0) return;
-    /* Wrap as SSE: "data: <json>\n\n" */
-    char  hdr[8] = "data: ";
+    /* Assemble "data: <json>\n" (json already ends with its own newline,
+     * so the trailing '\n' here completes the SSE event terminator) into
+     * one buffer and write it with a single send(). Splitting into three
+     * send() calls let a slow browser take the header, return EAGAIN on
+     * the body, and keep the FD open mid-frame -- the next event then
+     * appended a fresh "data: " on top of the half-written one and
+     * corrupted every subsequent message on that client. */
+    static const char HDR[] = "data: ";
+    const size_t hdrlen = sizeof(HDR) - 1;
+    const size_t total  = hdrlen + len + 1;
+
+    char  stackbuf[4096];
+    char *buf = stackbuf;
+    if (total > sizeof(stackbuf)) {
+        buf = malloc(total);
+        if (!buf) return;
+    }
+    memcpy(buf, HDR, hdrlen);
+    memcpy(buf + hdrlen, json, len);
+    buf[hdrlen + len] = '\n';
+
     pthread_mutex_lock(&g_lock);
     for (int i = 0; i < g_sse_count; ) {
         int fd = g_sse_fds[i];
-        ssize_t r1 = send(fd, hdr,  6,    MSG_NOSIGNAL | MSG_DONTWAIT);
-        ssize_t r2 = send(fd, json, len,  MSG_NOSIGNAL | MSG_DONTWAIT);
-        ssize_t r3 = send(fd, "\n", 1,    MSG_NOSIGNAL | MSG_DONTWAIT);
-        if (r1 < 0 || r2 < 0 || r3 < 0) {
-            if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                close(fd);
-                g_sse_fds[i] = g_sse_fds[--g_sse_count];
-                continue;
-            }
+        ssize_t w = send(fd, buf, total, MSG_NOSIGNAL | MSG_DONTWAIT);
+        /* Any short write or EAGAIN means we cannot keep this client
+         * framed -- close it. A reload reconnects fresh and replays
+         * from g_history. */
+        if (w < (ssize_t)total) {
+            close(fd);
+            g_sse_fds[i] = g_sse_fds[--g_sse_count];
+            continue;
         }
         ++i;
     }
@@ -1762,6 +2461,8 @@ void web_publish_line(const char *json, size_t len)
         e->buf = NULL; e->len = 0; /* malloc fail: slot empty, ring intact */
     }
     pthread_mutex_unlock(&g_lock);
+
+    if (buf != stackbuf) free(buf);
 }
 
 void web_shutdown(void)

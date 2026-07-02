@@ -35,6 +35,24 @@ op_mode_t     opt_op_mode             = OP_MODE_DECODE;
 bool          opt_alert_off_grid      = false;
 bool          opt_list_devices        = false;
 bool          opt_print_schema        = false;
+bool          opt_trusted_only        = false;
+bool          opt_show_untrusted      = false;
+bool          opt_diagnostics         = false;
+deep_decode_mode_t opt_deep_decode    = DEEP_DECODE_AUTO;
+int           opt_focus_workers       = 2;
+double        opt_focus_hold_s        = 5.0;
+int           opt_focus_rewind_ms     = 20;
+int           opt_focus_ring_ms       = 500;
+char         *opt_focus_freqs_csv     = NULL;
+double        opt_focus_min_snr_db    = 6.0;
+int           opt_focus_os            = 0;    /* 0 = auto policy */
+
+char         *opt_snapshot_store_dir     = NULL;
+int           opt_snapshot_window_pre_ms = 50;
+int           opt_snapshot_window_post_ms= 100;
+long long     opt_snapshot_disk_mb       = 2048;     /* 2 GiB cap */
+long long     opt_snapshot_age_s         = 86400;    /* 24 h */
+double        opt_snapshot_min_snr_db    = -1.0;     /* <0: inherit focus floor */
 
 char         *opt_region              = NULL;
 char         *opt_preset_csv          = NULL;
@@ -43,6 +61,11 @@ char         *opt_keys_file           = NULL;
 char         *opt_share_url           = NULL;
 char         *opt_iq_record           = NULL;
 char         *opt_stats_json          = NULL;
+char         *opt_fftw_wisdom         = NULL;
+char         *opt_webhook_url         = NULL;
+char         *opt_webhook_on          = NULL;
+char         *opt_webhook_format      = NULL;
+int           opt_webhook_timeout_ms  = 1000;
 
 extra_freq_t  opt_extra_freqs[EXTRA_FREQ_MAX];
 int           opt_extra_freq_count    = 0;
@@ -50,6 +73,7 @@ int           opt_extra_freq_count    = 0;
 /* SDR / file input */
 char       *opt_input_file = NULL;
 iq_format_t iq_format      = FMT_CI8;
+bool        opt_iq_format_set = false;
 
 /* Per-backend gain controls.
  *
@@ -98,6 +122,7 @@ char *opt_zmq_curve_keygen        = NULL;
 uint32_t opt_station_t_acc_ns     = 1000000;  /* 1 ms = NTP-class default; mlat solver weights by this */
 char *opt_cot_multicast           = NULL;
 int   opt_web_port                = 0;
+int   opt_web_waterfall           = 0;
 char *opt_station_id              = NULL;
 char *opt_gpsd_endpoint           = NULL;
 char *opt_api_token               = NULL;
@@ -117,6 +142,35 @@ void options_print_help(const char *prog)
         "  --scan                 off-grid LoRa discovery only (no decode)\n"
         "  --scan-and-decode      both: decode grid, alert on off-grid sightings\n"
         "  --alert-off-grid       emit OFF_GRID_LORA alerts on first off-grid sighting\n"
+        "  --trusted-only         suppress fields_trusted:false events from JSON/UDP/MQTT/web feeds\n"
+        "                         (stats counters still tally everything; only publishing is filtered)\n"
+        "  --show-untrusted       include CRC-fail/no-CRC events even when --trusted-only is set\n"
+        "                         (kept off by default in deep-decode-auto mode)\n"
+        "\n"
+        "Scan-then-focus deep decode (wideband scanner always on, focused workers wake on activity):\n"
+        "  --deep-decode=MODE     off | auto (default auto). 'auto' enables the focused-worker pool\n"
+        "                         driven by wideband preamble locks; wideband never goes blind.\n"
+        "                         Pass 'off' to disable on weak CPUs or for a strict wideband-only run.\n"
+        "  --focus-workers=N      bounded pool size, 1..4 (default 2)\n"
+        "  --focus-hold-s=S       seconds of frame inactivity before a worker idles (default 5)\n"
+        "  --focus-rewind-ms=N    rewind from 'now' when a preamble lock arrives (default 20)\n"
+        "  --focus-ring-ms=N      raw-IQ ring buffer in ms of history (default 500)\n"
+        "  --focus-freqs=LIST     optional allowlist (decimal Hz, comma-separated). Default: any slot.\n"
+        "  --focus-min-snr-db=DB  drop pool promotions below this preamble-lock SNR (default 6).\n"
+        "                         Wideband decode is unaffected; this only filters which locks\n"
+        "                         wake a focused worker. Set 0 to promote on every lock.\n"
+        "  --focus-os=N|auto      focused decoder oversampling (default auto; N=1,2,4,8)\n"
+        "  --snapshot-store=DIR   write a bounded raw-IQ window + JSON sidecar to DIR/YYYYMMDD/\n"
+        "                         on every qualifying wideband preamble lock. Off by default.\n"
+        "                         Snapshot writes happen on a separate thread; decode is\n"
+        "                         never blocked by disk. Activating this option auto-enables\n"
+        "                         the iq-ring even when --deep-decode=off.\n"
+        "  --snapshot-window-pre-ms=N    samples before lock to include (default 50)\n"
+        "  --snapshot-window-post-ms=N   samples after  lock to include (default 100)\n"
+        "  --snapshot-store-disk-mb=N    rolling cap on total snapshot bytes (default 2048)\n"
+        "  --snapshot-store-age-s=N      rolling cap on snapshot age in seconds (default 86400)\n"
+        "  --snapshot-min-snr-db=DB      SNR floor; default = --focus-min-snr-db\n"
+        "  --diagnostics          enable verbose internal counters (demod stats, focus telemetry, etc.)\n"
         "\n"
         "SDR selection (one):\n"
         "  --hackrf[=SERIAL]      use HackRF One\n"
@@ -129,15 +183,18 @@ void options_print_help(const char *prog)
         "  --vita49=[BIND:]PORT   listen for VITA-49 (VRT) UDP. PORT is required;\n"
         "                         BIND defaults to 0.0.0.0. Sender side must use:\n"
         "                           - VRT signal-data packets (network byte order, big-endian)\n"
-        "                           - matching --iq-format (ci8 default, ci16, or cf32)\n"
+        "                           - an --iq-format matching the payload, unless the\n"
+        "                             sender's IF-context declares the payload format\n"
         "                         VRL wrapper ('VRLP') is auto-detected (optional).\n"
-        "                         IF-context packets are auto-adopted: sample_rate (Q44.20)\n"
-        "                         and RF freq override missing CLI values, so a sender\n"
-        "                         that emits context can run with bare --vita49=PORT.\n"
+        "                         IF-context packets are auto-adopted: sample_rate (Q44.20),\n"
+        "                         RF freq, and data-packet payload format override missing\n"
+        "                         CLI values, so a sender that emits context can run with\n"
+        "                         bare --vita49=PORT.\n"
         "  --file=PATH            replay IQ file\n"
         "  --iq-format=FMT        cs8 (default) | cs16 | cf32. Used for raw file replay\n"
-        "                         AND for the VITA-49 payload format -- the sender's\n"
-        "                         sample type must match.\n"
+        "                         AND for the VITA-49 payload format. For VITA-49 this is\n"
+        "                         only needed when the sender's context omits the payload\n"
+        "                         format; an explicit value here always wins.\n"
         "\n"
         "RF:\n"
         "  --center=HZ            center frequency (default: region-derived)\n"
@@ -180,6 +237,21 @@ void options_print_help(const char *prog)
         "                         HZ:bw=BW:sf=SF:cr=CR (repeatable, max %d)\n"
         "  --iq-record=PATH       tee raw IQ samples to a file for later replay\n"
         "  --stats-json=PATH      write per-channel stats JSON every 5s (rotates)\n"
+        "  --fftw-wisdom[=PATH]   load/save FFTW plan timing data so cold starts skip\n"
+        "                         the FFTW_MEASURE benchmark (off by default). Without\n"
+        "                         PATH uses $XDG_CACHE_HOME/meshtastic-sniffer/fftw.wisdom\n"
+        "                         or $HOME/.cache/meshtastic-sniffer/fftw.wisdom.\n"
+        "  --webhook-url=URL      POST JSON event lines to URL on a background thread.\n"
+        "                         Non-blocking; bounded queue; never stalls decode.\n"
+        "                         Default allowlist: PSK_DISCOVERED, OFF_GRID_LORA,\n"
+        "                         GEOFENCE_ENTRY, GEOFENCE_EXIT. Override via --webhook-on.\n"
+        "  --webhook-on=A,B,C     comma-separated event allowlist for --webhook-url.\n"
+        "                         Event names match the 'event' field in the JSON.\n"
+        "  --webhook-format=FMT   raw (default) posts the sniffer's JSON verbatim;\n"
+        "                         slack wraps a short summary as {\"text\":...} so\n"
+        "                         the URL can be a Slack incoming-webhook directly;\n"
+        "                         discord posts {\"content\":...} for Discord webhooks.\n"
+        "  --webhook-timeout-ms=N per-POST timeout (clamped 100..30000, default 1000).\n"
         "\n"
         "Outputs (any combination):\n"
         "  --feed=HOST:PORT       JSON UDP feed (repeatable, max %d)\n"
@@ -190,6 +262,10 @@ void options_print_help(const char *prog)
         "                         republish ATAK port-72 PLIs as CoT XML to a\n"
         "                         multicast group (default port 6969). LAN-scope.\n"
         "  --web[=PORT]           built-in dashboard (default 8888)\n"
+        "  --web-waterfall=on|off live wideband spectrum + decoded-packet overlay\n"
+        "                         on a Spectrum tab. Off by default; when on,\n"
+        "                         enables the scanner if it is not already running\n"
+        "                         and publishes WATERFALL SSE events.\n"
         "  --station-id=ID        station identifier in feed messages\n"
         "  --gpsd[=HOST:PORT]     read this station's own GPS from gpsd\n"
         "                         (default localhost:2947). Tags every emitted\n"
@@ -304,12 +380,19 @@ int options_parse(int argc, char **argv)
         O_USRP, O_VITA49, O_FILE, O_IQ_FORMAT,
         O_CENTER, O_RATE, O_GAIN, O_BIAS, O_PPM, O_CLOCK,
         O_REGION, O_PRESETS, O_KEYS, O_KEYS_FILE, O_SHARE_URL, O_EXTRA_FREQ,
-        O_IQ_RECORD, O_STATS_JSON,
-        O_FEED, O_MQTT, O_MQTT_TOPIC, O_ZMQ, O_COT, O_WEB, O_STATION, O_GPSD, O_API_TOKEN,
+        O_IQ_RECORD, O_STATS_JSON, O_FFTW_WISDOM,
+        O_WEBHOOK_URL, O_WEBHOOK_ON, O_WEBHOOK_FORMAT, O_WEBHOOK_TIMEOUT_MS,
+        O_FEED, O_MQTT, O_MQTT_TOPIC, O_ZMQ, O_COT, O_WEB, O_WEB_WATERFALL,
+        O_STATION, O_GPSD, O_API_TOKEN,
         O_PCAP, O_PCAP_FIFO, O_PSK_WORDLIST, O_ARCHIVE, O_GEOFENCE, O_ANNOUNCE_TO, O_C2_DEALER,
         O_ZMQ_CURVE_SECRET, O_ZMQ_CURVE_KEYGEN, O_STATION_T_ACC_NS,
         O_HACKRF_LNA, O_HACKRF_VGA, O_HACKRF_AMP, O_HACKRF_AMP_OFF, O_USRP_OTW,
-        O_DECODE, O_SCAN, O_SCAN_DEC, O_ALERT_OFF_GRID,
+        O_DECODE, O_SCAN, O_SCAN_DEC, O_ALERT_OFF_GRID, O_TRUSTED_ONLY,
+        O_SHOW_UNTRUSTED, O_DIAGNOSTICS,
+        O_DEEP_DECODE, O_FOCUS_WORKERS, O_FOCUS_HOLD_S, O_FOCUS_REWIND_MS,
+        O_FOCUS_FREQS, O_FOCUS_RING_MS, O_FOCUS_MIN_SNR_DB, O_FOCUS_OS,
+        O_SNAPSHOT_STORE, O_SNAPSHOT_PRE_MS, O_SNAPSHOT_POST_MS,
+        O_SNAPSHOT_DISK_MB, O_SNAPSHOT_AGE_S, O_SNAPSHOT_MIN_SNR_DB,
         O_SIMD_GEN, O_SELFTEST, O_SELFTEST_REJECTION, O_SELFTEST_REJECTION_AMP,
         O_SELFTEST_REJECTION_TWOTONE, O_SELFTEST_REJECTION_OFFBIN,
         O_SELFTEST_REJECTION_PROCGAIN,
@@ -344,6 +427,11 @@ int options_parse(int argc, char **argv)
         { "share-url",  required_argument, NULL, O_SHARE_URL },
         { "iq-record",  required_argument, NULL, O_IQ_RECORD },
         { "stats-json", required_argument, NULL, O_STATS_JSON },
+        { "fftw-wisdom", optional_argument, NULL, O_FFTW_WISDOM },
+        { "webhook-url",        required_argument, NULL, O_WEBHOOK_URL },
+        { "webhook-on",         required_argument, NULL, O_WEBHOOK_ON },
+        { "webhook-format",     required_argument, NULL, O_WEBHOOK_FORMAT },
+        { "webhook-timeout-ms", required_argument, NULL, O_WEBHOOK_TIMEOUT_MS },
         { "extra-freq", required_argument, NULL, O_EXTRA_FREQ },
         { "feed",       required_argument, NULL, O_FEED },
         { "mqtt",       required_argument, NULL, O_MQTT },
@@ -351,6 +439,7 @@ int options_parse(int argc, char **argv)
         { "zmq",        optional_argument, NULL, O_ZMQ },
         { "cot-multicast", required_argument, NULL, O_COT },
         { "web",        optional_argument, NULL, O_WEB },
+        { "web-waterfall", required_argument, NULL, O_WEB_WATERFALL },
         { "station-id", required_argument, NULL, O_STATION },
         { "gpsd",       optional_argument, NULL, O_GPSD },
         { "api-token",  required_argument, NULL, O_API_TOKEN },
@@ -368,6 +457,23 @@ int options_parse(int argc, char **argv)
         { "scan",       no_argument,       NULL, O_SCAN },
         { "scan-and-decode", no_argument,  NULL, O_SCAN_DEC },
         { "alert-off-grid",  no_argument,  NULL, O_ALERT_OFF_GRID },
+        { "trusted-only",    no_argument,       NULL, O_TRUSTED_ONLY },
+        { "show-untrusted",  no_argument,       NULL, O_SHOW_UNTRUSTED },
+        { "diagnostics",     no_argument,       NULL, O_DIAGNOSTICS },
+        { "deep-decode",     required_argument, NULL, O_DEEP_DECODE },
+        { "focus-workers",   required_argument, NULL, O_FOCUS_WORKERS },
+        { "focus-hold-s",    required_argument, NULL, O_FOCUS_HOLD_S },
+        { "focus-rewind-ms", required_argument, NULL, O_FOCUS_REWIND_MS },
+        { "focus-freqs",     required_argument, NULL, O_FOCUS_FREQS },
+        { "focus-ring-ms",   required_argument, NULL, O_FOCUS_RING_MS },
+        { "focus-min-snr-db", required_argument, NULL, O_FOCUS_MIN_SNR_DB },
+        { "focus-os",        required_argument, NULL, O_FOCUS_OS },
+        { "snapshot-store",         required_argument, NULL, O_SNAPSHOT_STORE },
+        { "snapshot-window-pre-ms", required_argument, NULL, O_SNAPSHOT_PRE_MS },
+        { "snapshot-window-post-ms",required_argument, NULL, O_SNAPSHOT_POST_MS },
+        { "snapshot-store-disk-mb", required_argument, NULL, O_SNAPSHOT_DISK_MB },
+        { "snapshot-store-age-s",   required_argument, NULL, O_SNAPSHOT_AGE_S },
+        { "snapshot-min-snr-db",    required_argument, NULL, O_SNAPSHOT_MIN_SNR_DB },
         { "simd-generic", no_argument,     NULL, O_SIMD_GEN },
         { "selftest",   no_argument,       NULL, O_SELFTEST },
         { "selftest-rejection", no_argument, NULL, O_SELFTEST_REJECTION },
@@ -422,6 +528,7 @@ int options_parse(int argc, char **argv)
             else if (!strcasecmp(optarg, "cs16") || !strcasecmp(optarg, "ci16")) iq_format = FMT_CI16;
             else if (!strcasecmp(optarg, "cf32") || !strcasecmp(optarg, "fc32")) iq_format = FMT_CF32;
             else { fprintf(stderr, "unknown --iq-format=%s\n", optarg); return 2; }
+            opt_iq_format_set = true;
             break;
 
         case O_CENTER:  opt_center_freq_hz = strtoull(optarg, NULL, 10); break;
@@ -474,6 +581,14 @@ int options_parse(int argc, char **argv)
         case O_SHARE_URL:  opt_share_url  = strdup(optarg); break;
         case O_IQ_RECORD:  opt_iq_record  = strdup(optarg); break;
         case O_STATS_JSON: opt_stats_json = strdup(optarg); break;
+        case O_FFTW_WISDOM:
+            /* Empty string means "use the default cache path". */
+            opt_fftw_wisdom = strdup(optarg ? optarg : "");
+            break;
+        case O_WEBHOOK_URL:        opt_webhook_url    = strdup(optarg); break;
+        case O_WEBHOOK_ON:         opt_webhook_on     = strdup(optarg); break;
+        case O_WEBHOOK_FORMAT:     opt_webhook_format = strdup(optarg); break;
+        case O_WEBHOOK_TIMEOUT_MS: opt_webhook_timeout_ms = atoi(optarg); break;
         case O_EXTRA_FREQ:
             if (parse_extra_freq(optarg) < 0) {
                 fprintf(stderr, "bad --extra-freq=%s (need HZ:bw=BW:sf=SF:cr=CR)\n", optarg);
@@ -498,6 +613,16 @@ int options_parse(int argc, char **argv)
         case O_ZMQ:        opt_zmq_endpoint = optarg ? strdup(optarg) : strdup("tcp://*:7008"); break;
         case O_COT:        opt_cot_multicast = strdup(optarg); break;
         case O_WEB:        opt_web_port = optarg ? atoi(optarg) : 8888; break;
+        case O_WEB_WATERFALL:
+            if (!optarg || !strcasecmp(optarg, "on") || !strcmp(optarg, "1"))
+                opt_web_waterfall = 1;
+            else if (!strcasecmp(optarg, "off") || !strcmp(optarg, "0"))
+                opt_web_waterfall = 0;
+            else {
+                fprintf(stderr, "--web-waterfall: expected 'on' or 'off', got '%s'\n", optarg);
+                return 2;
+            }
+            break;
         case O_STATION:    opt_station_id = strdup(optarg); break;
         case O_GPSD:       opt_gpsd_endpoint = strdup(optarg ? optarg : "localhost:2947"); break;
         case O_API_TOKEN:  opt_api_token = strdup(optarg); break;
@@ -520,6 +645,48 @@ int options_parse(int argc, char **argv)
         case O_SCAN:             opt_op_mode = OP_MODE_SCAN; break;
         case O_SCAN_DEC:         opt_op_mode = OP_MODE_SCAN_AND_DECODE; break;
         case O_ALERT_OFF_GRID:   opt_alert_off_grid = true; break;
+        case O_TRUSTED_ONLY:     opt_trusted_only   = true; break;
+        case O_SHOW_UNTRUSTED:   opt_show_untrusted = true; break;
+        case O_DIAGNOSTICS:      opt_diagnostics    = true; break;
+        case O_DEEP_DECODE:
+            if (!strcasecmp(optarg, "off"))       opt_deep_decode = DEEP_DECODE_OFF;
+            else if (!strcasecmp(optarg, "auto")) opt_deep_decode = DEEP_DECODE_AUTO;
+            else { fprintf(stderr,
+                           "--deep-decode must be off|auto (got %s)\n", optarg);
+                   return 2; }
+            break;
+        case O_FOCUS_WORKERS: {
+            int n = atoi(optarg);
+            if (n < 1 || n > 4) {
+                fprintf(stderr, "--focus-workers must be 1..4 (got %s)\n", optarg);
+                return 2;
+            }
+            opt_focus_workers = n;
+            break;
+        }
+        case O_FOCUS_HOLD_S:    opt_focus_hold_s    = atof(optarg); break;
+        case O_FOCUS_REWIND_MS: opt_focus_rewind_ms = atoi(optarg); break;
+        case O_FOCUS_RING_MS:   opt_focus_ring_ms   = atoi(optarg); break;
+        case O_FOCUS_FREQS:     opt_focus_freqs_csv = strdup(optarg); break;
+        case O_FOCUS_MIN_SNR_DB: opt_focus_min_snr_db = atof(optarg); break;
+        case O_FOCUS_OS:
+            if (!strcasecmp(optarg, "auto")) {
+                opt_focus_os = 0;
+            } else {
+                int n = atoi(optarg);
+                if (!(n == 1 || n == 2 || n == 4 || n == 8)) {
+                    fprintf(stderr, "--focus-os must be auto,1,2,4,8 (got %s)\n", optarg);
+                    return 2;
+                }
+                opt_focus_os = n;
+            }
+            break;
+        case O_SNAPSHOT_STORE:        opt_snapshot_store_dir       = strdup(optarg); break;
+        case O_SNAPSHOT_PRE_MS:       opt_snapshot_window_pre_ms   = atoi(optarg);  break;
+        case O_SNAPSHOT_POST_MS:      opt_snapshot_window_post_ms  = atoi(optarg);  break;
+        case O_SNAPSHOT_DISK_MB:      opt_snapshot_disk_mb         = atoll(optarg); break;
+        case O_SNAPSHOT_AGE_S:        opt_snapshot_age_s           = atoll(optarg); break;
+        case O_SNAPSHOT_MIN_SNR_DB:   opt_snapshot_min_snr_db      = atof(optarg);  break;
 
         case O_SIMD_GEN: opt_force_simd_generic = true; break;
         case O_SELFTEST: return 100;

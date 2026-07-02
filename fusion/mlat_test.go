@@ -197,3 +197,96 @@ func TestSolveDegradesWithBadClock(t *testing.T) {
 		t.Fatalf("solver blew up: %.0f m error", errM)
 	}
 }
+
+// TestTimestampClassResolution verifies that LockTNs (software_lock)
+// wins over TNs (frame) when both are present, that a solve with only
+// frame-class observations reports class=frame, and that mixed
+// observations land in degraded=true.
+func TestTimestampClassResolution(t *testing.T) {
+	const lat0, lon0 = 39.0, -98.0
+	emitterLat, emitterLon := lat0+0.005, lon0+0.003
+
+	stations := []struct {
+		name     string
+		lat, lon float64
+	}{
+		{"alpha", lat0 + 0.010, lon0 - 0.010},
+		{"bravo", lat0 + 0.000, lon0 + 0.012},
+		{"delta", lat0 - 0.012, lon0 - 0.002},
+		{"echo", lat0 + 0.008, lon0 + 0.008},
+	}
+	const txTimeNs = uint64(1_700_000_000_000_000_000)
+	mkObs := func(useLock bool) []MlatObservation {
+		obs := make([]MlatObservation, len(stations))
+		for i, s := range stations {
+			dx, dy := llToEnu(s.lat, s.lon, emitterLat, emitterLon)
+			dist := math.Hypot(dx, dy)
+			flightNs := uint64(dist / speedOfLight * 1e9)
+			o := MlatObservation{
+				StationName: s.name, Lat: s.lat, Lon: s.lon, TAccNs: 100,
+			}
+			// frame-class observation always has a (worse) TNs filled
+			o.TNs = txTimeNs + flightNs + uint64(10_000_000) // +10ms demod-latency offset
+			if useLock {
+				// software_lock-class observation has the precise lock time
+				o.LockTNs = txTimeNs + flightNs
+			}
+			obs[i] = o
+		}
+		return obs
+	}
+
+	// Frame-only: solver consumes TNs, class=frame.
+	resFrame, err := Solve(mkObs(false))
+	if err != nil {
+		t.Fatalf("Solve frame-only: %v", err)
+	}
+	if resFrame.WorstTimestampCls != TimestampFrame {
+		t.Errorf("frame-only solve: worst class = %v, want frame", resFrame.WorstTimestampCls)
+	}
+	if resFrame.Degraded {
+		t.Errorf("frame-only solve should not be degraded")
+	}
+	if resFrame.TimestampClasses[TimestampFrame] != len(stations) {
+		t.Errorf("frame-only solve: frame count = %d, want %d",
+			resFrame.TimestampClasses[TimestampFrame], len(stations))
+	}
+
+	// Software-lock for all: solver consumes LockTNs, class=software_lock.
+	// The +10ms offset on TNs proves LockTNs won (frame-class would
+	// have placed the emitter ~3000 km away).
+	resLock, err := Solve(mkObs(true))
+	if err != nil {
+		t.Fatalf("Solve lock-only: %v", err)
+	}
+	if resLock.WorstTimestampCls != TimestampSoftwareLock {
+		t.Errorf("lock-only solve: worst class = %v, want software_lock", resLock.WorstTimestampCls)
+	}
+	if resLock.Degraded {
+		t.Errorf("lock-only solve should not be degraded")
+	}
+	dx, dy := llToEnu(resLock.Lat, resLock.Lon, emitterLat, emitterLon)
+	if math.Hypot(dx, dy) > 50 {
+		t.Errorf("LockTNs should have produced an accurate solve, got %.0f m error",
+			math.Hypot(dx, dy))
+	}
+
+	// Mixed: 2 stations with LockTNs, 2 without. Should flag degraded.
+	mixed := mkObs(true)
+	mixed[0].LockTNs = 0 // back to frame-only
+	mixed[1].LockTNs = 0
+	resMixed, err := Solve(mixed)
+	if err != nil {
+		t.Fatalf("Solve mixed: %v", err)
+	}
+	if !resMixed.Degraded {
+		t.Errorf("mixed-class solve should be degraded")
+	}
+	if resMixed.WorstTimestampCls != TimestampFrame {
+		t.Errorf("mixed-class solve: worst class = %v, want frame", resMixed.WorstTimestampCls)
+	}
+	t.Logf("mixed: %d frame + %d software_lock = degraded=%v",
+		resMixed.TimestampClasses[TimestampFrame],
+		resMixed.TimestampClasses[TimestampSoftwareLock],
+		resMixed.Degraded)
+}

@@ -19,12 +19,17 @@
 #include "c2_dealer.h"
 #include "dedup.h"
 #include "feed.h"
+#include "focused.h"
 #include "geofence.h"
 #include "gpsd.h"
+#include "iq_ring.h"
+#include "iq_snapshot.h"
 #include "pcap_out.h"
 #include "psk_dict.h"
 #include "schema.h"
 #include "fftw_lock.h"
+#include "fftw_wisdom.h"
+#include "webhook.h"
 #include "file_src.h"
 #include "keyset.h"
 #include "lora.h"
@@ -122,6 +127,81 @@ static void install_signal_handlers(void)
 /* ---- Global pipeline state ---- */
 
 channelizer_t *g_channelizer = NULL;
+/* Optional raw-IQ ring buffer that mirrors everything the sample pump
+ * processes. Allocated only when MESHTASTIC_IQ_RING_MS is set, so the
+ * default cluster2 path sees no allocations and no copies. Lives for
+ * scan-then-focus: a scanner-side detection emits a sample-index range
+ * and a focused decoder rewinds via iq_ring_get_window(). */
+static iq_ring_t *g_iq_ring = NULL;
+static size_t     g_iq_ring_ms = 0;
+static size_t     g_iq_ring_capacity_samples = 0;
+
+/* Forward-decl: defined later in this file. Used by the lazy-spawn
+ * block inside process_sample_buf so the focused worker's frames flow
+ * into the same dedup pipeline as the wideband channels'. */
+static void on_lora_frame(const uint8_t *payload, size_t payload_len,
+                          const lora_frame_meta_t *meta, void *user);
+/* on_wideband_preamble_lock is defined after g_samples_total below. */
+static void on_wideband_preamble_lock(int sf, int cr, int bw_hz,
+                                      float snr_db, void *user);
+
+/* Single-slot auto-promoted focused worker. Same shape as the manual
+ * one but armed by the preamble_lock callback from a wideband
+ * channel. Spec via MESHTASTIC_FOCUS_AUTO=freq:bw:sf:cr -- only locks
+ * matching (sf, cr, bw_hz) at the configured freq promote, since the
+ * focused DDC is built once for a specific slot. Superseded by the
+ * pool (MESHTASTIC_FOCUS_POOL) when both env vars are set; kept here
+ * for the single-slot path that pre-dated the pool. */
+static focused_worker_t *g_focused_auto = NULL;
+static int               g_focused_auto_channel_id = -1;
+static char              g_focused_auto_spec[128];
+static double            g_focused_auto_freq_hz = 0.0;
+static int               g_focused_auto_bw_hz = 0;
+static int               g_focused_auto_sf = 0;
+static int               g_focused_auto_cr = 0;
+static double            g_focused_auto_hold_down_s = 5.0;
+static uint64_t          g_focused_auto_rewind_samples = 200000;
+static _Atomic uint64_t  g_focused_auto_arm_count = 0;
+
+/* Bounded pool of generic focused workers. Any wideband preamble
+ * lock promotes to the pool; workers are slot-coalesced (same
+ * freq/bw/sf/cr refreshes the existing worker) or assigned to an
+ * idle peer. When all workers are busy a promotion is dropped and
+ * counted -- no eviction. Sized 1..FOCUS_POOL_MAX via
+ * MESHTASTIC_FOCUS_POOL=N. */
+#define FOCUS_POOL_MAX 4
+static focused_worker_t *g_focus_pool[FOCUS_POOL_MAX];
+static int               g_focus_pool_size = 0;
+static int               g_focus_pool_cfg_size = 0;     /* env value */
+static double            g_focus_pool_hold_down_s = 5.0;
+static int               g_focus_pool_rewind_ms = 20;
+static int               g_focus_os_factor = 0;          /* 0 = per-slot auto */
+static int               g_focus_pool_inited = 0;
+static pthread_mutex_t   g_focus_pool_mu = PTHREAD_MUTEX_INITIALIZER;
+/* Optional frequency allowlist (decimal Hz, comma-separated). Empty
+ * means "accept any wideband slot". With --presets=all the wideband
+ * PFB at os=1 produces many leakage-bin preamble locks; the
+ * allowlist lets the operator tell the pool which slots are worth
+ * focusing on, mirroring the focused_demo test shape. */
+#define FOCUS_POOL_FREQS_MAX 32
+static uint64_t          g_focus_pool_freqs[FOCUS_POOL_FREQS_MAX];
+static int               g_focus_pool_freqs_n = 0;
+static double            g_focus_pool_min_snr_db         = 0.0;
+static _Atomic uint64_t  g_focus_pool_promote_total      = 0;
+static _Atomic uint64_t  g_focus_pool_promote_below_snr  = 0;
+static _Atomic uint64_t  g_focus_pool_promote_matched    = 0;
+static _Atomic uint64_t  g_focus_pool_promote_assigned   = 0;
+static _Atomic uint64_t  g_focus_pool_promote_dropped    = 0;
+
+/* Single manual focused worker driven from the ring.
+ * Activated by MESHTASTIC_FOCUS_MANUAL=freq:bw:sf:cr[:start_sample].
+ * Lifecycle (idle/decoding/hold-down) and multi-worker fan-out land
+ * in Commit 3 / 4; for now this is the simplest possible proof that
+ * the focused path can rewind from the ring inside the main sniffer. */
+static focused_worker_t *g_focused_manual = NULL;
+static int               g_focused_manual_channel_id = -1;
+static char              g_focused_manual_spec[128];
+static uint64_t          g_focused_manual_start_sample = 0;
 static keyset_t      *g_keys = NULL;
 static lora_decoder_t *g_demods[CHANNELIZER_MAX_CHANNELS];
 static scanner_t     *g_scanner = NULL;
@@ -164,6 +244,7 @@ static double  g_iq_record_peak_mag2 = 0; /* max |sample|^2 observed */
 
 /* Per-channel rolling stats for --stats-json. Bumped from on_lora_frame
  * by channel id, dumped every 5s to stats-json file (rotates in place). */
+#define CHAN_SNR_HISTORY_BUCKETS 60   /* one minute each = 1 hour of history */
 typedef struct {
     uint64_t frames;
     uint64_t decrypted;
@@ -176,9 +257,26 @@ typedef struct {
     int      sf;
     int      cr;
     int      bw_hz;
+    uint64_t freq_hz;
     char     preset_name[24];
+
+    /* Rolling per-minute SNR history. Sliced into CHAN_SNR_HISTORY_BUCKETS
+     * buckets, one per wall-clock minute. snr_history_last_min is the
+     * unix-minute the most recent bucket covers; on a new minute the head
+     * advances and any skipped buckets are cleared. Only frames with
+     * payload_crc_ok feed this so the sparkline tracks real packet
+     * quality, not ambient noise or CRC-fail leakage. */
+    double   snr_history_sum[CHAN_SNR_HISTORY_BUCKETS];
+    uint16_t snr_history_count[CHAN_SNR_HISTORY_BUCKETS];
+    int      snr_history_head;        /* index of the current (newest) bucket */
+    uint64_t snr_history_last_min;    /* unix epoch seconds / 60 */
 } chan_stat_t;
 static chan_stat_t g_chan_stats[CHANNELIZER_MAX_CHANNELS];
+/* Guards the non-atomic fields in chan_stat_t -- snr_db_sum (double) and
+ * snr_db_count (int). frames/bytes are already atomics. Contention is
+ * negligible: writer is the dedup drainer once per emit, reader is the
+ * stats heartbeat once a second. */
+static pthread_mutex_t g_chan_stats_mu = PTHREAD_MUTEX_INITIALIZER;
 
 /* ---- Sample pump: decouple SDR recv from DSP -------------------------
  *
@@ -251,6 +349,218 @@ static void process_sample_buf(sample_buf_t *buf)
      * peak magnitude and clip count so the user can see when the input
      * is near full-scale (clip count > 0 means quantization is losing
      * dynamic range and the SDR gain should come down). */
+    /* Tee into the raw-IQ ring buffer when enabled. Created lazily on the
+     * first buffer so the ring matches the SDR's native format without
+     * the main thread having to predict it. */
+    if (g_iq_ring_ms > 0 && !g_iq_ring) {
+        size_t cap = (size_t)((double)samp_rate * (double)g_iq_ring_ms / 1000.0 + 0.5);
+        if (cap < 1024) cap = 1024;
+        g_iq_ring = iq_ring_create(cap, buf->format);
+        if (g_iq_ring) {
+            g_iq_ring_capacity_samples = cap;
+            double bytes = (double)cap *
+                (double)iq_ring_bytes_per_sample(buf->format);
+            fprintf(stderr,
+                    "iq-ring: enabled (%zu samples = %.0f MiB, %.0f ms @ %.3f Msps, "
+                    "format=%s)\n",
+                    cap, bytes / (1024.0 * 1024.0),
+                    (double)g_iq_ring_ms, samp_rate / 1e6,
+                    buf->format == SAMPLE_FMT_FLOAT ? "cf32" : "cs8");
+        } else {
+            fprintf(stderr, "iq-ring: allocation failed -- disabled.\n");
+            g_iq_ring_ms = 0;
+        }
+    }
+    if (g_iq_ring) iq_ring_append(g_iq_ring, buf->samples, buf->num);
+
+    /* Lazy-init the snapshot store the first time samples flow through
+     * the ring. Done here, not in main(), so the writer thread can read
+     * iq_ring_format() from the populated ring. */
+    if (g_iq_ring && opt_snapshot_store_dir && !iq_snapshot_enabled()) {
+        double min_snr = opt_snapshot_min_snr_db >= 0.0
+                         ? opt_snapshot_min_snr_db
+                         : opt_focus_min_snr_db;
+        iq_snapshot_cfg_t scfg = {
+            .dir              = opt_snapshot_store_dir,
+            .window_pre_ms    = opt_snapshot_window_pre_ms,
+            .window_post_ms   = opt_snapshot_window_post_ms,
+            .disk_cap_mb      = opt_snapshot_disk_mb,
+            .age_cap_seconds  = opt_snapshot_age_s,
+            .min_snr_db       = min_snr,
+            .ring             = g_iq_ring,
+            .sample_rate      = samp_rate,
+            .station_id       = opt_station_id,
+            .station_t_acc_ns = (uint32_t)opt_station_t_acc_ns,
+            .queue_capacity   = 64,
+        };
+        const char *qcap = getenv("MESHTASTIC_SNAPSHOT_QUEUE_CAP");
+        if (qcap && *qcap) {
+            int qc = atoi(qcap);
+            if (qc >= 1 && qc <= 4096) scfg.queue_capacity = qc;
+        }
+        if (iq_snapshot_init(&scfg) == 0) {
+            fprintf(stderr,
+                    "snapshot-store: enabled dir=%s pre=%dms post=%dms "
+                    "disk_cap=%lldMB age_cap=%llds min_snr=%.1fdB\n",
+                    opt_snapshot_store_dir,
+                    opt_snapshot_window_pre_ms, opt_snapshot_window_post_ms,
+                    opt_snapshot_disk_mb, opt_snapshot_age_s, min_snr);
+        } else {
+            fprintf(stderr, "snapshot-store: init failed for dir=%s\n",
+                    opt_snapshot_store_dir);
+        }
+    }
+
+    /* Lazy-spawn the manual focused worker the first time samples are
+     * flowing through the ring. Done here, not in main(), because the
+     * ring itself is created lazily by the block above and the worker
+     * needs the ring to exist before focused_worker_create() can
+     * register a config. */
+    if (g_iq_ring && g_focused_manual_spec[0] && !g_focused_manual) {
+        /* Parse freq:bw:sf:cr[:start_sample]. */
+        long long freq_hz = 0, bw_hz = 0;
+        int sf = 0, cr = 0;
+        unsigned long long start_sample_ull = 0;
+        int nparsed = sscanf(g_focused_manual_spec, "%lld:%lld:%d:%d:%llu",
+                             &freq_hz, &bw_hz, &sf, &cr, &start_sample_ull);
+        if (nparsed >= 4 && sf >= 7 && sf <= 12 && cr >= 5 && cr <= 8
+            && bw_hz > 0 && freq_hz > 0) {
+            /* Allocate a stat slot for this focused worker so JSON
+             * output gets a real freq_hz / preset_name. We use the top
+             * of g_chan_stats[] so it never collides with the wideband
+             * channels build_channel_set() populated from id=0 up. */
+            int focus_id = CHANNELIZER_MAX_CHANNELS - 1;
+            g_chan_stats[focus_id].sf      = sf;
+            g_chan_stats[focus_id].cr      = cr;
+            g_chan_stats[focus_id].bw_hz   = (int)bw_hz;
+            g_chan_stats[focus_id].freq_hz = (uint64_t)freq_hz;
+            strncpy(g_chan_stats[focus_id].preset_name, "Focused",
+                    sizeof(g_chan_stats[focus_id].preset_name) - 1);
+
+            g_focused_manual_channel_id   = focus_id;
+            g_focused_manual_start_sample = (uint64_t)start_sample_ull;
+            focused_cfg_t fcfg = {
+                .channel_hz    = (double)freq_hz,
+                .bw_hz         = (int)bw_hz,
+                .sf            = sf,
+                .cr            = cr,
+                .os_factor     = g_focus_os_factor ? g_focus_os_factor : 1,
+                .sdr_center_hz = (double)center_freq,
+                .sdr_samp_rate = samp_rate,
+                .ring          = g_iq_ring,
+                .frame_cb      = on_lora_frame,
+                .frame_cb_user = (void *)(intptr_t)focus_id,
+                .label         = "manual",
+            };
+            g_focused_manual = focused_worker_create(&fcfg);
+            if (!g_focused_manual ||
+                focused_worker_start(g_focused_manual,
+                                     g_focused_manual_start_sample,
+                                     1 /* sticky: never fall back to IDLE */) != 0) {
+                fprintf(stderr, "focused: worker create/start failed; "
+                                "manual focus inactive.\n");
+                if (g_focused_manual) {
+                    focused_worker_destroy(g_focused_manual);
+                    g_focused_manual = NULL;
+                }
+                g_focused_manual_channel_id = -1;
+            } else {
+                fprintf(stderr, "focused: manual worker armed at "
+                                "channel_id=%d, start_sample=%llu.\n",
+                        focus_id,
+                        (unsigned long long)g_focused_manual_start_sample);
+            }
+        } else {
+            fprintf(stderr, "focused: bad MESHTASTIC_FOCUS_MANUAL spec '%s'\n",
+                    g_focused_manual_spec);
+            g_focused_manual_spec[0] = 0;
+        }
+    }
+
+    /* Lazy-spawn the pool workers once the ring exists. */
+    if (g_iq_ring && g_focus_pool_cfg_size > 0 && !g_focus_pool_inited) {
+        g_focus_pool_inited = 1;
+        for (int i = 0; i < g_focus_pool_cfg_size; ++i) {
+            int chan_id = CHANNELIZER_MAX_CHANNELS - 2 - i;  /* 1022..1019 */
+            char label[32];
+            snprintf(label, sizeof(label), "pool%d", i);
+            focused_cfg_t fcfg = {
+                /* leave channel_hz / bw_hz / sf / cr at 0 -- generic
+                 * worker; the DDC + decoder are built at first
+                 * focused_worker_arm_slot() call from the dispatcher. */
+                .channel_hz    = 0.0,
+                .bw_hz         = 0,
+                .sf            = 0,
+                .cr            = 0,
+                .os_factor     = g_focus_os_factor ? g_focus_os_factor : 1,
+                .sdr_center_hz = (double)center_freq,
+                .sdr_samp_rate = samp_rate,
+                .ring          = g_iq_ring,
+                .frame_cb      = on_lora_frame,
+                .frame_cb_user = (void *)(intptr_t)chan_id,
+                .label         = label,
+            };
+            focused_worker_t *w = focused_worker_create(&fcfg);
+            if (!w || focused_worker_start(w, 0, 0 /* non-sticky */) != 0) {
+                fprintf(stderr, "focus-pool: worker %d spawn failed\n", i);
+                if (w) focused_worker_destroy(w);
+                continue;
+            }
+            /* Reserve a g_chan_stats slot per pool worker so its
+             * decoded frames get a freq_hz/preset_name in JSON. */
+            strncpy(g_chan_stats[chan_id].preset_name, "FocusedPool",
+                    sizeof(g_chan_stats[chan_id].preset_name) - 1);
+            g_focus_pool[g_focus_pool_size++] = w;
+        }
+        fprintf(stderr, "focus-pool: %d worker(s) spawned (channel_ids "
+                        "%d..%d, idle until promotion)\n",
+                g_focus_pool_size,
+                CHANNELIZER_MAX_CHANNELS - 2,
+                CHANNELIZER_MAX_CHANNELS - 2 - g_focus_pool_size + 1);
+    }
+
+    /* Lazy-spawn the single-slot auto (scanner-triggered) worker.
+     * Stays IDLE until on_wideband_preamble_lock arms it. */
+    if (g_iq_ring && g_focused_auto_spec[0] && !g_focused_auto &&
+        g_focused_auto_freq_hz > 0.0) {
+        int focus_id = CHANNELIZER_MAX_CHANNELS - 2;  /* sibling of manual */
+        g_chan_stats[focus_id].sf      = g_focused_auto_sf;
+        g_chan_stats[focus_id].cr      = g_focused_auto_cr;
+        g_chan_stats[focus_id].bw_hz   = g_focused_auto_bw_hz;
+        g_chan_stats[focus_id].freq_hz = (uint64_t)g_focused_auto_freq_hz;
+        strncpy(g_chan_stats[focus_id].preset_name, "FocusedAuto",
+                sizeof(g_chan_stats[focus_id].preset_name) - 1);
+        g_focused_auto_channel_id = focus_id;
+        focused_cfg_t fcfg = {
+            .channel_hz    = g_focused_auto_freq_hz,
+            .bw_hz         = g_focused_auto_bw_hz,
+            .sf            = g_focused_auto_sf,
+            .cr            = g_focused_auto_cr,
+            .os_factor     = g_focus_os_factor ? g_focus_os_factor : 1,
+            .sdr_center_hz = (double)center_freq,
+            .sdr_samp_rate = samp_rate,
+            .ring          = g_iq_ring,
+            .frame_cb      = on_lora_frame,
+            .frame_cb_user = (void *)(intptr_t)focus_id,
+            .label         = "auto",
+        };
+        g_focused_auto = focused_worker_create(&fcfg);
+        if (g_focused_auto &&
+            focused_worker_start(g_focused_auto, 0,
+                                 0 /* non-sticky: armed by preamble cb */) == 0) {
+            fprintf(stderr, "focused: auto worker spawned at "
+                            "channel_id=%d (idle until scanner promotion)\n",
+                    focus_id);
+        } else {
+            fprintf(stderr, "focused: auto worker spawn failed\n");
+            if (g_focused_auto) {
+                focused_worker_destroy(g_focused_auto);
+                g_focused_auto = NULL;
+            }
+            g_focused_auto_channel_id = -1;
+        }
+    }
+
     if (g_iq_record_fp) {
         if (buf->format == SAMPLE_FMT_FLOAT && g_iq_record_target_cs8) {
             const float *flt = (const float *)buf->samples;
@@ -457,6 +767,12 @@ static void on_off_grid_discovery(const scanner_discovery_t *disc, void *user)
         (unsigned long long)disc->f_hz, (double)disc->snr_db, (double)disc->bw_hz_estimate);
     if (n < 0) return;
     fwrite(line, 1, (size_t)n, stdout); fflush(stdout);
+    char sum[160];
+    snprintf(sum, sizeof(sum),
+             "Off-grid LoRa: %.3f MHz, SNR %.1f dB, ~%.0f kHz",
+             disc->f_hz / 1e6, (double)disc->snr_db,
+             (double)disc->bw_hz_estimate / 1000.0);
+    webhook_publish("OFF_GRID_LORA", line, (size_t)n, sum);
     fprintf(stderr, "[scanner] off-grid LoRa-shaped energy at %.3f MHz, SNR %.1f dB\n",
             disc->f_hz / 1e6, (double)disc->snr_db);
 }
@@ -515,6 +831,11 @@ static void replay_check(const mesh_event_t *ev)
             if (n > 0) {
                 fwrite(line, 1, (size_t)n, stdout); fflush(stdout);
                 if (opt_web_port > 0) web_publish_line(line, (size_t)n);
+                char sum[160];
+                snprintf(sum, sizeof(sum),
+                         "Replay suspected: from !%08x, packet %u, %.1fs later",
+                         from, pid, (double)delta_us / 1.0e6);
+                webhook_publish("REPLAY_SUSPECTED", line, (size_t)n, sum);
             }
             e->alerted = true;
         }
@@ -541,6 +862,9 @@ typedef struct {
     float    cfo_hz;
     uint64_t station_t_ns;     /* first-replica realtime ns */
     uint32_t station_t_acc_ns; /* operator-self-reported clock-discipline class */
+    uint64_t preamble_lock_sample_idx; /* abs SDR sample idx at lock; 0 if unknown */
+    float    preamble_lock_sample_frac;/* sub-sample frac, SDR-sample units */
+    uint64_t preamble_lock_t_ns;       /* CLOCK_REALTIME at preamble-lock detect */
 } frame_emit_ctx_t;
 
 static void on_mesh_event(const mesh_event_t *ev, void *user) {
@@ -551,12 +875,18 @@ static void on_mesh_event(const mesh_event_t *ev, void *user) {
     mesh_event_t stamped = *ev;
     stamped.slot_id = (channel_id >= 0 && channel_id < CHANNELIZER_MAX_CHANNELS)
                       ? channel_id : -1;
+    if (channel_id >= 0 && channel_id < CHANNELIZER_MAX_CHANNELS)
+        stamped.freq_hz = g_chan_stats[channel_id].freq_hz;
     if (ctx) {
         stamped.has_crc          = ctx->has_crc;
         stamped.payload_crc_ok   = ctx->payload_crc_ok;
         stamped.cfo_hz           = ctx->cfo_hz;
         stamped.station_t_ns     = ctx->station_t_ns;
         stamped.station_t_acc_ns = ctx->station_t_acc_ns;
+        stamped.preamble_lock_sample_idx = ctx->preamble_lock_sample_idx;
+        stamped.sample_rate_sps  = (uint64_t)(samp_rate + 0.5);
+        stamped.preamble_lock_sample_frac = ctx->preamble_lock_sample_frac;
+        stamped.preamble_lock_t_ns = ctx->preamble_lock_t_ns;
         /* CRC-failed frames have corrupt bytes by definition. AES-CTR is
          * a stream cipher with no integrity check, so the protobuf
          * parser can "succeed" on garbage and produce fictitious
@@ -586,7 +916,7 @@ static void on_mesh_event(const mesh_event_t *ev, void *user) {
  * expired by handing its best-SNR replica to mesh_packet_decode_with_radio.
  * The decode runs OUTSIDE the dedup mutex so the decrypt + publish
  * path doesn't serialize against incoming replicas. */
-static volatile bool g_dedup_drainer_run = false;
+static atomic_bool g_dedup_drainer_run = false;
 static pthread_t     g_dedup_drainer_tid;
 
 static void dedup_emit_locked(const dedup_entry_t *e)
@@ -603,8 +933,43 @@ static void dedup_emit_locked(const dedup_entry_t *e)
         __atomic_add_fetch(&g_chan_stats[channel_id].frames, 1, __ATOMIC_RELAXED);
         __atomic_add_fetch(&g_chan_stats[channel_id].bytes,
                            e->best_payload_len, __ATOMIC_RELAXED);
+        pthread_mutex_lock(&g_chan_stats_mu);
         g_chan_stats[channel_id].snr_db_sum   += (double)e->best_meta.snr_db;
         g_chan_stats[channel_id].snr_db_count += 1;
+        /* Per-minute SNR history ring -- only count frames whose CRC passed
+         * (or had no CRC at all, treated as trusted). CRC-fail replicas are
+         * bit-corrupted phantoms whose SNR estimate would mislead. */
+        bool trusted = !e->best_meta.has_crc || e->best_meta.payload_crc_ok;
+        if (trusted) {
+            chan_stat_t *cs = &g_chan_stats[channel_id];
+            uint64_t now_min = (uint64_t)time(NULL) / 60u;
+            if (cs->snr_history_last_min == 0) {
+                /* First sample: align to the current minute. */
+                cs->snr_history_last_min = now_min;
+            } else if (now_min > cs->snr_history_last_min) {
+                /* Advance the head one bucket per elapsed minute, clearing
+                 * skipped buckets so gaps in traffic show as gaps. Cap at
+                 * the ring size: if more than CHAN_SNR_HISTORY_BUCKETS
+                 * minutes elapsed, wipe the whole ring. */
+                uint64_t skipped = now_min - cs->snr_history_last_min;
+                if (skipped >= CHAN_SNR_HISTORY_BUCKETS) {
+                    memset(cs->snr_history_sum, 0, sizeof(cs->snr_history_sum));
+                    memset(cs->snr_history_count, 0, sizeof(cs->snr_history_count));
+                    cs->snr_history_head = 0;
+                } else {
+                    for (uint64_t k = 0; k < skipped; ++k) {
+                        cs->snr_history_head =
+                            (cs->snr_history_head + 1) % CHAN_SNR_HISTORY_BUCKETS;
+                        cs->snr_history_sum  [cs->snr_history_head] = 0.0;
+                        cs->snr_history_count[cs->snr_history_head] = 0;
+                    }
+                }
+                cs->snr_history_last_min = now_min;
+            }
+            cs->snr_history_sum  [cs->snr_history_head] += (double)e->best_meta.snr_db;
+            cs->snr_history_count[cs->snr_history_head] += 1;
+        }
+        pthread_mutex_unlock(&g_chan_stats_mu);
     }
     /* PCAP output: write the wire-shape frame (16-byte radio header +
      * still-encrypted payload) before any decrypt attempt, with the
@@ -623,6 +988,12 @@ static void dedup_emit_locked(const dedup_entry_t *e)
         .cfo_hz           = e->best_meta.cfo_hz,
         .station_t_ns     = e->first_seen_t_ns,
         .station_t_acc_ns = (uint32_t)opt_station_t_acc_ns,
+        /* Per-frame anchor stamped by lora.c at preamble-lock fire;
+         * survives the dedup snapshot, so a later lock on the same
+         * channel can't overwrite this frame's cursor. */
+        .preamble_lock_sample_idx  = e->best_meta.preamble_lock_sample_idx,
+        .preamble_lock_sample_frac = e->best_meta.preamble_lock_sample_frac,
+        .preamble_lock_t_ns        = e->best_meta.preamble_lock_t_ns,
     };
     mesh_packet_decode_with_radio(e->best_payload, e->best_payload_len,
                                   e->best_meta.rssi_db, e->best_meta.snr_db,
@@ -654,7 +1025,7 @@ static void *dedup_drainer_thread(void *arg)
      * emit. That keeps lock-hold time bounded and decoupled from the
      * decode/publish path which can block on mqtt/web/stdout. */
     dedup_entry_t batch[DEDUP_DRAIN_BATCH];
-    while (g_dedup_drainer_run) {
+    while (atomic_load_explicit(&g_dedup_drainer_run, memory_order_acquire)) {
         usleep(5000); /* 5 ms tick = ~6 ticks per window */
         uint64_t now_us = dedup_monotonic_us();
         atomic_store_explicit(&g_drainer_last_tick_us, now_us, memory_order_relaxed);
@@ -678,13 +1049,13 @@ static void *dedup_drainer_thread(void *arg)
 
 static void dedup_drainer_start(void)
 {
-    g_dedup_drainer_run = true;
+    atomic_store_explicit(&g_dedup_drainer_run, true, memory_order_release);
     pthread_create(&g_dedup_drainer_tid, NULL, dedup_drainer_thread, NULL);
 }
 
 static void dedup_drainer_stop(void)
 {
-    g_dedup_drainer_run = false;
+    atomic_store_explicit(&g_dedup_drainer_run, false, memory_order_release);
     pthread_join(g_dedup_drainer_tid, NULL);
     /* Single locked sweep, emit outside the lock. */
     dedup_entry_t batch[DEDUP_RING_SIZE];
@@ -709,6 +1080,190 @@ static void on_lora_frame(const uint8_t *payload, size_t payload_len,
 {
     intptr_t channel_id = (intptr_t)user;
     dedup_buffer(payload, payload_len, meta, channel_id);
+}
+
+/* Stamp the per-channel stat slot a pool worker emits frames under
+ * with the slot it is currently configured for. This is what gives
+ * focused-pool JSON lines a freq_hz / sf / cr / bw_hz / preset_name
+ * so downstream tools can attribute them to a real channel instead
+ * of seeing a synthetic high channel_id with zeros. */
+static void focus_pool_stamp_chan_stats(int worker_idx, double freq_hz,
+                                        int bw_hz, int sf, int cr)
+{
+    int chan_id = CHANNELIZER_MAX_CHANNELS - 2 - worker_idx;
+    if (chan_id < 0 || chan_id >= CHANNELIZER_MAX_CHANNELS) return;
+    g_chan_stats[chan_id].sf      = sf;
+    g_chan_stats[chan_id].cr      = cr;
+    g_chan_stats[chan_id].bw_hz   = bw_hz;
+    g_chan_stats[chan_id].freq_hz = (uint64_t)freq_hz;
+    /* preset_name was set to "FocusedPool" at spawn; leave it. */
+}
+
+static int focus_os_for_slot(int bw_hz, int sf, int cr)
+{
+    (void)cr;
+    if (g_focus_os_factor == 1 || g_focus_os_factor == 2 ||
+        g_focus_os_factor == 4 || g_focus_os_factor == 8)
+        return g_focus_os_factor;
+
+    /* Auto policy from focused direct-DDC SFO=25 measurements:
+     * SF7/BW250 and SF9/BW250 need os4; SF10/SF11/BW250 need os8;
+     * BW500 ShortTurbo/LongTurbo prefer os2 on common 20/26 Msps rates.
+     * Other slots keep os1 unless they are long-SF narrowband, where os8
+     * remains exact at 20/26 Msps and preserves the long-range margin. */
+    if (bw_hz == 500000) return 2;
+    if (bw_hz == 250000) {
+        if (sf >= 10) return 8;
+        if (sf == 7 || sf == 9) return 4;
+        return 1;
+    }
+    if (bw_hz == 125000 && sf >= 11) return 8;
+    return 1;
+}
+
+/* Pool-mode dispatcher: route a wideband preamble lock to the pool. */
+static void promote_to_pool(double freq_hz, int bw_hz, int sf, int cr,
+                            uint64_t now_samples)
+{
+    if (g_focus_pool_size <= 0) return;
+    uint64_t rewind = (uint64_t)((double)g_focus_pool_rewind_ms
+                                  * samp_rate / 1000.0);
+    uint64_t start = (now_samples > rewind) ? (now_samples - rewind) : 0;
+    double   hd    = g_focus_pool_hold_down_s;
+    int      os    = focus_os_for_slot(bw_hz, sf, cr);
+
+    uint64_t total = atomic_fetch_add(&g_focus_pool_promote_total, 1) + 1;
+    pthread_mutex_lock(&g_focus_pool_mu);
+    /* 1) coalesce: a worker already focused on this slot just gets a
+     *    refresh -- no DDC rebuild, no idle worker eaten. */
+    for (int i = 0; i < g_focus_pool_size; ++i) {
+        focused_worker_t *w = g_focus_pool[i];
+        if (!w) continue;
+        double cf; int cb = 0, csf = 0, ccr = 0;
+        if (focused_worker_current_slot(w, &cf, &cb, &csf, &ccr) &&
+            cf == freq_hz && cb == bw_hz && csf == sf && ccr == cr &&
+            focused_worker_state(w) != FOCUSED_STATE_IDLE) {
+            focused_worker_arm_slot_os(w, freq_hz, bw_hz, sf, cr, os, start, hd);
+            focus_pool_stamp_chan_stats(i, freq_hz, bw_hz, sf, cr);
+            atomic_fetch_add(&g_focus_pool_promote_matched, 1);
+            pthread_mutex_unlock(&g_focus_pool_mu);
+            return;
+        }
+    }
+    /* 2) assign an idle worker. */
+    for (int i = 0; i < g_focus_pool_size; ++i) {
+        focused_worker_t *w = g_focus_pool[i];
+        if (!w) continue;
+        if (focused_worker_state(w) == FOCUSED_STATE_IDLE) {
+            focused_worker_arm_slot_os(w, freq_hz, bw_hz, sf, cr, os, start, hd);
+            focus_pool_stamp_chan_stats(i, freq_hz, bw_hz, sf, cr);
+            uint64_t armed = atomic_fetch_add(&g_focus_pool_promote_assigned, 1) + 1;
+            pthread_mutex_unlock(&g_focus_pool_mu);
+            /* Throttle stderr noise: log first 5, then every 25th. */
+            if (armed <= 5 || (armed % 25) == 0) {
+                fprintf(stderr,
+                        "focus-pool: assign #%llu (total promotions=%llu) "
+                        "worker[%d] <- %.3fMHz BW=%d SF=%d CR=4/%d os=%d "
+                        "start=%llu\n",
+                        (unsigned long long)armed,
+                        (unsigned long long)total, i,
+                        freq_hz / 1e6, bw_hz, sf, cr, os,
+                        (unsigned long long)start);
+            }
+            return;
+        }
+    }
+    /* 3) all busy: drop. */
+    atomic_fetch_add(&g_focus_pool_promote_dropped, 1);
+    pthread_mutex_unlock(&g_focus_pool_mu);
+}
+
+/* A wideband channel just preamble-locked. If the pool is configured,
+ * route the event to it (any slot, any worker). Otherwise fall back
+ * to the single-slot MESHTASTIC_FOCUS_AUTO worker. Runs on the
+ * decoder's calling thread; focused_worker_arm() is threadsafe. */
+static void on_wideband_preamble_lock(int sf, int cr, int bw_hz,
+                                      float snr_db, void *user)
+{
+    (void)snr_db;
+    intptr_t channel_id = (intptr_t)user;
+    if (channel_id < 0 || channel_id >= CHANNELIZER_MAX_CHANNELS) return;
+    uint64_t now = __atomic_load_n(&g_samples_total, __ATOMIC_RELAXED);
+    /* TDOA anchor lives on lora_frame_meta_t now: lora.c stamps it at
+     * preamble-lock fire from the per-feed stream cursor that
+     * on_channel_baseband / focused_process_chunk set before each
+     * feed. This callback only owns the wake-the-focused-pool side. */
+
+    /* Snapshot store: enqueue a raw-IQ capture request. Decoupled from
+     * the focused-pool path so a station can run snapshots with or
+     * without focused workers. The enqueue is O(1) and never blocks
+     * on disk; queue overflow drops the snapshot and bumps a counter. */
+    if (iq_snapshot_enabled()) {
+        uint64_t chan_freq = g_chan_stats[channel_id].freq_hz;
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        iq_snapshot_event_t sev = {
+            .lock_sample_idx = now,
+            .lock_t_ns       = (uint64_t)ts.tv_sec * 1000000000ULL +
+                               (uint64_t)ts.tv_nsec,
+            .snr_db_at_lock  = (double)snr_db,
+            .sf              = sf,
+            .cr              = cr,
+            .bw_hz           = bw_hz,
+            .freq_hz         = chan_freq,
+        };
+        const char *pn = g_chan_stats[channel_id].preset_name;
+        if (pn && *pn) {
+            strncpy(sev.preset_name, pn, sizeof(sev.preset_name) - 1);
+            sev.preset_name[sizeof(sev.preset_name) - 1] = 0;
+        }
+        iq_snapshot_enqueue(&sev);
+    }
+
+    /* Pool mode: any wideband slot promotes, optionally filtered by
+     * the freq allowlist and the SNR floor. The SNR gate stops the
+     * pool from burning workers on low-quality preamble locks
+     * (mostly PFB bin-leakage ghosts and noise) -- wideband decode
+     * is unaffected, so confirmed wideband frames still publish. */
+    if (g_focus_pool_size > 0) {
+        uint64_t chan_freq = g_chan_stats[channel_id].freq_hz;
+        if (chan_freq == 0) return;
+        if (g_focus_pool_freqs_n > 0) {
+            int allowed = 0;
+            for (int i = 0; i < g_focus_pool_freqs_n; ++i)
+                if (g_focus_pool_freqs[i] == chan_freq) { allowed = 1; break; }
+            if (!allowed) return;
+        }
+        if (g_focus_pool_min_snr_db > 0.0 &&
+            (double)snr_db < g_focus_pool_min_snr_db) {
+            atomic_fetch_add(&g_focus_pool_promote_below_snr, 1);
+            return;
+        }
+        promote_to_pool((double)chan_freq, bw_hz, sf, cr, now);
+        return;
+    }
+
+    /* Single-slot backwards-compat path (Commit 4). */
+    if (!g_focused_auto) return;
+    if (sf != g_focused_auto_sf || cr != g_focused_auto_cr ||
+        bw_hz != g_focused_auto_bw_hz) return;
+    uint64_t chan_freq = g_chan_stats[channel_id].freq_hz;
+    if ((double)chan_freq != g_focused_auto_freq_hz) return;
+    uint64_t rewind = (uint64_t)((double)g_focused_auto_rewind_samples
+                                  * samp_rate / 1000.0);
+    uint64_t start = (now > rewind) ? (now - rewind) : 0;
+    focused_worker_arm(g_focused_auto, start, g_focused_auto_hold_down_s);
+    uint64_t armed = atomic_fetch_add(&g_focused_auto_arm_count, 1) + 1;
+    if (armed <= 5 || (armed % 10) == 0) {
+        fprintf(stderr,
+                "focused: promote #%llu from channel_id=%ld (%.3fMHz SF%d), "
+                "arm start_sample=%llu (now=%llu, rewind=%llu)\n",
+                (unsigned long long)armed, (long)channel_id,
+                (double)chan_freq / 1e6, sf,
+                (unsigned long long)start,
+                (unsigned long long)now,
+                (unsigned long long)rewind);
+    }
 }
 
 /* Forward decl for the web SSE publisher (we don't include web.h here
@@ -761,6 +1316,123 @@ static void *watchdog_thread(void *arg)
     return NULL;
 }
 
+/* Base64 encode `n` bytes from `src` into `dst`. Returns the number of
+ * output characters (not counting the NUL). `dst` must hold at least
+ * 4*((n+2)/3) + 1 bytes. Standard RFC 4648 alphabet, with '=' padding. */
+static size_t b64_encode(const uint8_t *src, size_t n, char *dst)
+{
+    static const char A[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t w = 0;
+    size_t i = 0;
+    while (i + 3 <= n) {
+        uint32_t v = ((uint32_t)src[i] << 16) | ((uint32_t)src[i+1] << 8) | src[i+2];
+        dst[w++] = A[(v >> 18) & 0x3F];
+        dst[w++] = A[(v >> 12) & 0x3F];
+        dst[w++] = A[(v >>  6) & 0x3F];
+        dst[w++] = A[ v        & 0x3F];
+        i += 3;
+    }
+    if (i < n) {
+        uint32_t v = (uint32_t)src[i] << 16;
+        if (i + 1 < n) v |= (uint32_t)src[i+1] << 8;
+        dst[w++] = A[(v >> 18) & 0x3F];
+        dst[w++] = A[(v >> 12) & 0x3F];
+        dst[w++] = (i + 1 < n) ? A[(v >> 6) & 0x3F] : '=';
+        dst[w++] = '=';
+    }
+    dst[w] = 0;
+    return w;
+}
+
+/* Publish one WATERFALL SSE row from the scanner snapshot. Off by
+ * default; called at 5 Hz from the stats thread when --web-waterfall=on
+ * and --web is set.
+ *
+ * The 4096-bin scanner snapshot is downsampled to 1024 display bins by
+ * max-hold groups of 4 -- max-hold preserves short bursts better than
+ * arithmetic mean for an at-a-glance visual. Each bin's power is then
+ * log-scaled to dB and clamped into a 0..255 byte (encoding "u8_db_v1",
+ * with documented db_min/db_max so a future client can interpret it
+ * even if we retune the colormap). Body is base64-wrapped so the
+ * existing SSE text transport carries it. */
+static void publish_waterfall_row(void)
+{
+    if (!g_scanner || opt_web_port <= 0 || !opt_web_waterfall) return;
+
+    static float    snap[4096];
+    static float    max_hold[1024];
+    static float    sort_buf[1024];
+    static uint8_t  bins[1024];
+    static char     b64[1366 + 1];
+
+    int n = scanner_snapshot(g_scanner, snap, 4096);
+    if (n <= 0) return;
+    /* 4096 -> 1024 max-hold groups of 4. If the scanner was built
+     * with a different FFT size, fall back to grouping by (n / 1024)
+     * bins. */
+    int group = n / 1024;
+    if (group < 1) group = 1;
+    int out_count = n / group;
+    if (out_count > 1024) out_count = 1024;
+
+    /* Two-pass: (1) max-hold downsample to linear power; (2) pick the
+     * 25th-percentile bin as the per-row noise reference and encode
+     * each bin as dB above noise, clipped to [db_min, db_max]. Doing
+     * it row-relative dodges the absolute-calibration question and
+     * keeps the colormap stable as gain changes. */
+    for (int i = 0; i < out_count; ++i) {
+        float peak = 0.0f;
+        int base = i * group;
+        for (int k = 0; k < group && base + k < n; ++k)
+            if (snap[base + k] > peak) peak = snap[base + k];
+        max_hold[i] = peak;
+        sort_buf[i] = peak;
+    }
+    /* Quickselect would be cheaper but qsort is fine at 1024 entries
+     * and runs only at 5 Hz. */
+    for (int i = 1; i < out_count; ++i) {
+        float v = sort_buf[i]; int j = i - 1;
+        while (j >= 0 && sort_buf[j] > v) { sort_buf[j + 1] = sort_buf[j]; --j; }
+        sort_buf[j + 1] = v;
+    }
+    float noise = sort_buf[out_count / 4];
+    if (noise <= 0.0f) noise = 1e-12f;
+
+    const float db_min = -10.0f, db_max = 50.0f;
+    const float db_span = db_max - db_min;
+    for (int i = 0; i < out_count; ++i) {
+        float db = (max_hold[i] > 0.0f) ? (10.0f * log10f(max_hold[i] / noise)) : db_min;
+        if (db < db_min) db = db_min;
+        if (db > db_max) db = db_max;
+        int v = (int)((db - db_min) / db_span * 255.0f + 0.5f);
+        if (v < 0) v = 0;
+        if (v > 255) v = 255;
+        bins[i] = (uint8_t)v;
+    }
+
+    size_t b64len = b64_encode(bins, (size_t)out_count, b64);
+
+    char line[2048];
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    double ts_d = (double)ts.tv_sec + ts.tv_nsec * 1e-9;
+    int sn = snprintf(line, sizeof(line),
+        "{\"event\":\"WATERFALL\",\"ts\":%.3f,"
+        "\"f_center_hz\":%llu,\"f_span_hz\":%u,"
+        "\"sample_rate_sps\":%u,\"bin_count\":%d,"
+        "\"encoding\":\"u8_db_rel_v1\",\"db_min\":%d,\"db_max\":%d,"
+        "\"bins\":\"%.*s\"}\n",
+        ts_d,
+        (unsigned long long)center_freq,
+        (unsigned)samp_rate,
+        (unsigned)samp_rate,
+        out_count,
+        (int)db_min, (int)db_max,
+        (int)b64len, b64);
+    if (sn > 0 && (size_t)sn < sizeof(line))
+        web_publish_line(line, (size_t)sn);
+}
+
 /* Heartbeat thread: stderr stats + SSE STATS event every 5 s. */
 static void *stats_thread(void *arg)
 {
@@ -771,7 +1443,15 @@ static void *stats_thread(void *arg)
     uint64_t prev_samples = 0;
     int      stats_counter = 0;
     while (running) {
-        for (int i = 0; i < 10 && running; ++i) usleep(100000); /* 1s, interruptible */
+        /* 1 s outer tick split into 10 x 100 ms sleeps so SIGINT lands
+         * promptly. Waterfall rows publish every other inner tick
+         * (200 ms = 5 Hz) when the feature is on. The publish is a
+         * no-op when the scanner is absent or --web-waterfall=off,
+         * so the loop shape is unchanged for stock runs. */
+        for (int i = 0; i < 10 && running; ++i) {
+            usleep(100000);
+            if ((i & 1) == 1) publish_waterfall_row();
+        }
         if (!running) break;
 
         /* 5s stderr stats + optional per-channel JSON. */
@@ -784,13 +1464,20 @@ static void *stats_thread(void *arg)
             uint64_t cp  = __atomic_load_n(&g_crc_pass_total, __ATOMIC_RELAXED);
             uint64_t cf  = __atomic_load_n(&g_crc_fail_total, __ATOMIC_RELAXED);
             uint64_t ct  = cp + cf;
-            char crc_buf[48];
+            /* No-CRC frames (implicit-header style) aren't counted toward the
+             * pass/fail rate because there's no CRC field on the wire to check.
+             * Surface their count alongside total so the f/ct gap is explained
+             * instead of looking like silent failures. */
+            uint64_t nc  = (f >= ct) ? (f - ct) : 0;
+            char crc_buf[80];
             if (ct > 0)
-                snprintf(crc_buf, sizeof(crc_buf), "CRC %.1f%% (%llu/%llu)",
+                snprintf(crc_buf, sizeof(crc_buf), "CRC %.1f%% (%llu/%llu, %llu no-CRC)",
                          100.0 * (double)cp / (double)ct,
-                         (unsigned long long)cp, (unsigned long long)ct);
+                         (unsigned long long)cp, (unsigned long long)ct,
+                         (unsigned long long)nc);
             else
-                snprintf(crc_buf, sizeof(crc_buf), "CRC -- (0/0)");
+                snprintf(crc_buf, sizeof(crc_buf), "CRC -- (0/0, %llu no-CRC)",
+                         (unsigned long long)nc);
             double rate_msps = (double)(s - prev_samples) / 5.0e6;
             prev_samples = s;
             /* Drainer liveness: if the dedup tick hasn't moved in 5x its
@@ -822,26 +1509,172 @@ static void *stats_thread(void *arg)
              * tags the source sniffer when --station-id is set;
              * fusion's subscriber loop falls back to the registry name
              * if absent. */
-            char sline[320];
+            char sline[1024];
             int sn;
             const char *sid = opt_station_id ? opt_station_id : "";
+            /* Derive a human-readable clock-discipline class from
+             * opt_station_t_acc_ns so the dashboard can show "Clock:
+             * GPSDO (100 ns)" at a glance. Operators self-report this
+             * via --station-t-acc-ns at startup. */
+            const char *clock_class = "NTP";
+            if (opt_station_t_acc_ns <= 200)            clock_class = "GPSDO";
+            else if (opt_station_t_acc_ns <= 2000)      clock_class = "PPS";
+            else if (opt_station_t_acc_ns <= 100000)    clock_class = "chrony";
+            /* Sum focused-pool worker frame totals so the dashboard
+             * can show how much the pool contributed cumulatively. */
+            uint64_t focus_frames_sum = 0;
+            uint64_t focus_fell_behind_sum = 0;
+            uint64_t focus_fell_behind_edge_sum = 0;
+            uint64_t focus_fell_behind_thru_sum = 0;
+            for (int i = 0; i < g_focus_pool_size; ++i) {
+                if (!g_focus_pool[i]) continue;
+                focus_frames_sum += focused_worker_frames_delivered(g_focus_pool[i]);
+                focus_fell_behind_sum += focused_worker_fell_behind_total(g_focus_pool[i]);
+                focus_fell_behind_edge_sum += focused_worker_fell_behind_edge_start(g_focus_pool[i]);
+                focus_fell_behind_thru_sum += focused_worker_fell_behind_throughput(g_focus_pool[i]);
+            }
+            uint64_t ring_samples = g_iq_ring ? iq_ring_total_appended(g_iq_ring) : 0;
+            int focus_active = (g_focus_pool_size > 0) ? 1 : 0;
+            int off_part = scanner_on
+                ? snprintf(NULL, 0, ",\"off_grid\":%llu", (unsigned long long)og)
+                : 0;
+            (void)off_part;
             if (scanner_on)
                 sn = snprintf(sline, sizeof(sline),
                     "{\"event\":\"STATS\",\"station\":\"%s\","
                     "\"msps\":%.2f,\"frames\":%llu,"
-                    "\"decrypted\":%llu,\"off_grid\":%llu}\n",
+                    "\"decrypted\":%llu,\"off_grid\":%llu,"
+                    "\"clock\":\"%s\",\"clock_acc_ns\":%lu,"
+                    "\"focus_active\":%s,\"focus_workers\":%d,"
+                    "\"focus_promotions\":%llu,\"focus_matched\":%llu,"
+                    "\"focus_assigned\":%llu,\"focus_dropped\":%llu,"
+                    "\"focus_below_snr\":%llu,\"focus_frames\":%llu,"
+                    "\"focus_fell_behind\":%llu,"
+                    "\"focus_fell_behind_edge\":%llu,"
+                    "\"focus_fell_behind_thru\":%llu,"
+                    "\"webhook_queued\":%llu,\"webhook_sent\":%llu,"
+                    "\"webhook_dropped\":%llu,\"webhook_failed\":%llu,"
+                    "\"ring_ms\":%d,\"ring_samples\":%llu}\n",
                     sid, rate_msps, (unsigned long long)f,
-                    (unsigned long long)d, (unsigned long long)og);
+                    (unsigned long long)d, (unsigned long long)og,
+                    clock_class, (unsigned long)opt_station_t_acc_ns,
+                    focus_active ? "true" : "false", g_focus_pool_size,
+                    (unsigned long long)atomic_load(&g_focus_pool_promote_total),
+                    (unsigned long long)atomic_load(&g_focus_pool_promote_matched),
+                    (unsigned long long)atomic_load(&g_focus_pool_promote_assigned),
+                    (unsigned long long)atomic_load(&g_focus_pool_promote_dropped),
+                    (unsigned long long)atomic_load(&g_focus_pool_promote_below_snr),
+                    (unsigned long long)focus_frames_sum,
+                    (unsigned long long)focus_fell_behind_sum,
+                    (unsigned long long)focus_fell_behind_edge_sum,
+                    (unsigned long long)focus_fell_behind_thru_sum,
+                    (unsigned long long)webhook_queued_total(),
+                    (unsigned long long)webhook_sent_total(),
+                    (unsigned long long)webhook_dropped_total(),
+                    (unsigned long long)webhook_failed_total(),
+                    (int)g_iq_ring_ms, (unsigned long long)ring_samples);
             else
                 sn = snprintf(sline, sizeof(sline),
                     "{\"event\":\"STATS\",\"station\":\"%s\","
                     "\"msps\":%.2f,\"frames\":%llu,"
-                    "\"decrypted\":%llu}\n",
+                    "\"decrypted\":%llu,"
+                    "\"clock\":\"%s\",\"clock_acc_ns\":%lu,"
+                    "\"focus_active\":%s,\"focus_workers\":%d,"
+                    "\"focus_promotions\":%llu,\"focus_matched\":%llu,"
+                    "\"focus_assigned\":%llu,\"focus_dropped\":%llu,"
+                    "\"focus_below_snr\":%llu,\"focus_frames\":%llu,"
+                    "\"focus_fell_behind\":%llu,"
+                    "\"focus_fell_behind_edge\":%llu,"
+                    "\"focus_fell_behind_thru\":%llu,"
+                    "\"webhook_queued\":%llu,\"webhook_sent\":%llu,"
+                    "\"webhook_dropped\":%llu,\"webhook_failed\":%llu,"
+                    "\"ring_ms\":%d,\"ring_samples\":%llu}\n",
                     sid, rate_msps, (unsigned long long)f,
-                    (unsigned long long)d);
+                    (unsigned long long)d,
+                    clock_class, (unsigned long)opt_station_t_acc_ns,
+                    focus_active ? "true" : "false", g_focus_pool_size,
+                    (unsigned long long)atomic_load(&g_focus_pool_promote_total),
+                    (unsigned long long)atomic_load(&g_focus_pool_promote_matched),
+                    (unsigned long long)atomic_load(&g_focus_pool_promote_assigned),
+                    (unsigned long long)atomic_load(&g_focus_pool_promote_dropped),
+                    (unsigned long long)atomic_load(&g_focus_pool_promote_below_snr),
+                    (unsigned long long)focus_frames_sum,
+                    (unsigned long long)focus_fell_behind_sum,
+                    (unsigned long long)focus_fell_behind_edge_sum,
+                    (unsigned long long)focus_fell_behind_thru_sum,
+                    (unsigned long long)webhook_queued_total(),
+                    (unsigned long long)webhook_sent_total(),
+                    (unsigned long long)webhook_dropped_total(),
+                    (unsigned long long)webhook_failed_total(),
+                    (int)g_iq_ring_ms, (unsigned long long)ring_samples);
             if (sn > 0) {
                 if (opt_web_port > 0) web_publish_line(sline, (size_t)sn);
                 zmq_pub_publish(sline, (size_t)sn);
+            }
+
+            /* Per-channel SNR sparkline. Separate event so the fixed
+             * sline[] buffer stays bounded; this one varies with how many
+             * channels have recent traffic. Format:
+             *   {"event":"CHAN_SNR","ts":...,"channels":[{"id":N,"snr":[..60..]}, ...]}
+             * Each sparkline value is a small int (rounded dB) or -1 to
+             * mean "no data in this minute." Only channels that have at
+             * least one sample anywhere in the ring are emitted, so an
+             * 800-channel grid with 5 active senders publishes 5 entries. */
+            if (opt_web_port > 0 || opt_zmq_endpoint) {
+                /* Worst-case sizing: 256 bytes overhead + 360 bytes per slot
+                 * (id field + 60 ints averaging 3 chars each + commas + JSON
+                 * wrapping). At CHANNELIZER_MAX_CHANNELS=1024 this peaks
+                 * around 370 KB, but the has-data filter typically keeps
+                 * actual emit at a few KB. Allocation is freed each tick. */
+                size_t cap = 256 +
+                    (size_t)CHANNELIZER_MAX_CHANNELS * 360;
+                char *chan_snr = malloc(cap);
+                if (chan_snr) {
+                    int csn = snprintf(chan_snr, cap,
+                        "{\"event\":\"CHAN_SNR\",\"ts\":%ld,\"channels\":[",
+                        (long)time(NULL));
+                    /* Iterate the WHOLE g_chan_stats range so focused-pool
+                     * slot decodes (channel ids 1019..1023 in the current
+                     * layout) get their SNR history published too. The
+                     * has-data check skips empties so this stays cheap. */
+                    bool first = true;
+                    pthread_mutex_lock(&g_chan_stats_mu);
+                    for (int i = 0; i < CHANNELIZER_MAX_CHANNELS
+                                  && csn > 0 && (size_t)csn < cap; ++i) {
+                        chan_stat_t *cs = &g_chan_stats[i];
+                        int has_data = 0;
+                        for (int b = 0; b < CHAN_SNR_HISTORY_BUCKETS; ++b)
+                            if (cs->snr_history_count[b]) { has_data = 1; break; }
+                        if (!has_data) continue;
+                        csn += snprintf(chan_snr + csn, cap - (size_t)csn,
+                                        "%s{\"id\":%d,\"snr\":[",
+                                        first ? "" : ",", i);
+                        first = false;
+                        /* Walk oldest-first so the dashboard renders left-to-right
+                         * as past-to-present. head is the newest bucket. */
+                        for (int k = 0; k < CHAN_SNR_HISTORY_BUCKETS
+                                     && csn > 0 && (size_t)csn < cap; ++k) {
+                            int idx = (cs->snr_history_head + 1 + k)
+                                      % CHAN_SNR_HISTORY_BUCKETS;
+                            int val = -1;
+                            if (cs->snr_history_count[idx]) {
+                                double avg = cs->snr_history_sum[idx]
+                                             / (double)cs->snr_history_count[idx];
+                                val = (int)(avg + (avg >= 0 ? 0.5 : -0.5));
+                            }
+                            csn += snprintf(chan_snr + csn, cap - (size_t)csn,
+                                            "%s%d", k ? "," : "", val);
+                        }
+                        csn += snprintf(chan_snr + csn, cap - (size_t)csn, "]}");
+                    }
+                    pthread_mutex_unlock(&g_chan_stats_mu);
+                    csn += snprintf(chan_snr + csn, cap - (size_t)csn, "]}\n");
+                    if (csn > 0 && (size_t)csn < cap) {
+                        if (opt_web_port > 0) web_publish_line(chan_snr, (size_t)csn);
+                        zmq_pub_publish(chan_snr, (size_t)csn);
+                    }
+                    free(chan_snr);
+                }
             }
 
             if (opt_stats_json) {
@@ -855,8 +1688,11 @@ static void *stats_thread(void *arg)
                     int n_ch = channelizer_num_channels(g_channelizer);
                     for (int i = 0; i < n_ch && i < CHANNELIZER_MAX_CHANNELS; ++i) {
                         chan_stat_t *cs = &g_chan_stats[i];
-                        double avg_snr = cs->snr_db_count
-                            ? cs->snr_db_sum / (double)cs->snr_db_count : 0.0;
+                        pthread_mutex_lock(&g_chan_stats_mu);
+                        double snr_sum = cs->snr_db_sum;
+                        int    snr_n   = cs->snr_db_count;
+                        pthread_mutex_unlock(&g_chan_stats_mu);
+                        double avg_snr = snr_n ? snr_sum / (double)snr_n : 0.0;
                         fprintf(sf, "%s{\"id\":%d", i ? "," : "", i);
                         if (cs->preset_name[0])
                             fprintf(sf, ",\"preset\":\"%s\"", cs->preset_name);
@@ -884,8 +1720,26 @@ static void on_channel_baseband(int channel_id,
 {
     (void)user;
     if (channel_id < 0 || channel_id >= CHANNELIZER_MAX_CHANNELS) return;
-    if (g_demods[channel_id])
+    if (g_demods[channel_id]) {
+        /* TDOA: announce the SDR-rate anchor for this baseband chunk
+         * before feeding. step_per_sample = SDR samples per channelizer
+         * output sample (= samp_rate / bw_hz, the PFB decimation).
+         * chunk_anchor is the SDR sample idx of the FIRST sample whose
+         * channelizer output is in this batch -- approximated as
+         * g_samples_total at callback time minus n*step. The PFB
+         * pipeline depth biases this by a constant offset shared by
+         * all stations with the same configuration; per-frame
+         * race-freeness still holds. */
+        int bw = g_chan_stats[channel_id].bw_hz;
+        if (bw > 0) {
+            uint32_t step  = (uint32_t)((samp_rate / (double)bw) + 0.5);
+            uint64_t now   = __atomic_load_n(&g_samples_total, __ATOMIC_RELAXED);
+            uint64_t span  = (uint64_t)n * (uint64_t)step;
+            uint64_t anchor = (now > span) ? (now - span) : 0;
+            lora_decoder_set_stream_cursor(g_demods[channel_id], anchor, step);
+        }
         lora_decoder_feed(g_demods[channel_id], samples, n);
+    }
 }
 
 static int instantiate_channel(uint64_t f_hz, int bw_hz, int sf, int cr);
@@ -907,6 +1761,33 @@ int app_add_runtime_extra_freq(uint64_t f_hz, int bw_hz, int sf, int cr)
 
 /* ---- Build the channel set for the configured (region, presets) pair ---- */
 
+/* Per-(SF,BW) PFB oversampling policy, enabled by MESHTASTIC_OS_POLICY=auto.
+ *
+ * Measured with tests/sensitivity.py --prototype-os at SFO=25 ppm / SNR=10 dB
+ * (n=30): each preset has a DISTINCT preferred oversampling factor. Native
+ * oversampling gives the decoder's fractional-STO/SFO machinery sub-sample
+ * resolution -- it closes the SFO gap to gr-lora/lorarx parity on the
+ * short/turbo presets, but it HURTS SF8 (ShortSlow declines 30->22->13 with
+ * more os) and is wasted on the already-clean BW125 long presets. So we apply
+ * oversampling ONLY where the measurements prove it helps, never globally.
+ *
+ *   SF7/BW250 ShortFast  : 0  -> 29/30 at os=2
+ *   SF7/BW500 ShortTurbo : 11 -> 30/30 at os=2
+ *   SF9/BW250 MediumFast : 19 -> 29/30 at os=4
+ *   SF11/BW500 LongTurbo : 0  -> 30/30 at os=2
+ *
+ * SF10/BW250 (MediumSlow) and SF11/BW250 (LongFast) are unhelped by ANY os
+ * (0 at 1/2/4) -- they need decoder-estimator work, not oversampling, so
+ * they stay at 1. Everything else is already at parity at os=1. */
+static int os_policy_auto(int sf, int bw_hz)
+{
+    if (sf == 7  && bw_hz == 250000) return 2;  /* ShortFast  */
+    if (sf == 7  && bw_hz == 500000) return 2;  /* ShortTurbo */
+    if (sf == 9  && bw_hz == 250000) return 4;  /* MediumFast */
+    if (sf == 11 && bw_hz == 500000) return 2;  /* LongTurbo  */
+    return 1;
+}
+
 static int instantiate_channel(uint64_t f_hz, int bw_hz, int sf, int cr)
 {
     /* Skip channels whose passband doesn't fit inside the capture.
@@ -923,13 +1804,38 @@ static int instantiate_channel(uint64_t f_hz, int bw_hz, int sf, int cr)
         return -1;
     }
 
-    /* The polyphase channelizer always emits critically sampled (output
-     * rate = bw_hz), so the LoRa demod runs at os_factor=1 regardless
-     * of the SDR-to-BW ratio. The fractional-STO compensation that the
-     * cascade DDC needed for real radio (os_factor>=2) is unnecessary
-     * here -- the PFB's prototype filter delivers integer-sample
-     * alignment by construction. */
+    /* The polyphase channelizer emits critically sampled channels (output
+     * rate = bw_hz) at os_factor=1. PROTOTYPE: MESHTASTIC_PROTOTYPE_OS=N
+     * makes the PFB natively oversample each channel by N (output rate
+     * N*bw_hz, same bw_hz-wide channel with guard band) and runs the
+     * decoder at os_factor=N, giving its fractional-STO/SFO machinery
+     * real sub-sample resolution. Default (unset) keeps os=1. */
     int os_factor = 1;
+    {
+        /* MESHTASTIC_OS_POLICY=auto opts into the measured per-(SF,BW)
+         * oversampling table. Default (unset) keeps every channel at os=1
+         * = unchanged production behaviour. */
+        const char *pol = getenv("MESHTASTIC_OS_POLICY");
+        if (pol && !strcmp(pol, "auto"))
+            os_factor = os_policy_auto(sf, bw_hz);
+        /* Explicit MESHTASTIC_PROTOTYPE_OS overrides the policy (diagnostics
+         * / forcing a single factor across all channels). */
+        const char *e = getenv("MESHTASTIC_PROTOTYPE_OS");
+        if (e) {
+            int v = atoi(e);
+            if (v >= 1 && v <= 4) os_factor = v;
+        }
+        /* DIAG: SF-gated os. MESHTASTIC_PROTOTYPE_OS_MAXSF caps which SF
+         * gets oversampled (default: all). Set to 7 to oversample only SF7. */
+        const char *ms = getenv("MESHTASTIC_PROTOTYPE_OS_MAXSF");
+        if (ms && sf > atoi(ms)) os_factor = 1;
+        /* Native oversampling needs M = samp_rate/bw divisible by os, else
+         * pfb_create_os fails. Fall back to os=1 if the grid doesn't divide. */
+        if (os_factor > 1) {
+            int M = (int)llround(samp_rate / (double)bw_hz);
+            if (M <= 0 || (M % os_factor) != 0) os_factor = 1;
+        }
+    }
     channel_cfg_t cfg = {
         .f_hz        = f_hz,
         .bw_hz       = bw_hz,
@@ -944,15 +1850,24 @@ static int instantiate_channel(uint64_t f_hz, int bw_hz, int sf, int cr)
 
     g_demods[id] = lora_decoder_create_os(sf, cr, bw_hz, os_factor);
     if (!g_demods[id]) return -1;
+    /* Per-slot RF carrier enables the SFO drift compensation path; without
+     * it the decoder's gr-lora_sdr-style SFO logic stays inert. */
+    lora_decoder_set_center_freq(g_demods[id], (double)f_hz);
     /* Stash channel id in user pointer so on_lora_frame can attribute stats. */
     lora_decoder_set_callback(g_demods[id], on_lora_frame, (void *)(intptr_t)id);
+    /* Every wideband channel can promote to a focused worker via the
+     * preamble-lock callback. The hook is a no-op when neither the
+     * pool nor the single-slot auto worker is configured. */
+    lora_decoder_set_preamble_cb(g_demods[id], on_wideband_preamble_lock,
+                                 (void *)(intptr_t)id);
 
     /* Capture this slot's radio params + preset name into per-channel stats
      * so the stats-json line is self-describing. */
     if (id >= 0 && id < CHANNELIZER_MAX_CHANNELS) {
-        g_chan_stats[id].sf    = sf;
-        g_chan_stats[id].cr    = cr;
-        g_chan_stats[id].bw_hz = bw_hz;
+        g_chan_stats[id].sf      = sf;
+        g_chan_stats[id].cr      = cr;
+        g_chan_stats[id].bw_hz   = bw_hz;
+        g_chan_stats[id].freq_hz = f_hz;
         g_chan_stats[id].preset_name[0] = 0;
         for (int p = 0; p < MESH_PRESET_COUNT; ++p) {
             const mesh_preset_def_t *d = &MESH_PRESETS[p];
@@ -1059,14 +1974,23 @@ static uint32_t backend_default_rate(sdr_backend_t b)
 
 static void resolve_rf_defaults(void)
 {
-    /* User-specified rate wins; otherwise pick from the backend table. */
+    /* Precedence: an explicit CLI flag wins; otherwise keep any value the
+     * VITA-49 listener already adopted from an IF-context packet (it writes
+     * samp_rate / center_freq directly before we run); only then fall back to
+     * the backend/region default. The bare clobber here used to wipe the
+     * adopted context rate back to the backend default (0 for VITA-49),
+     * turning a context-supplied stream into a fatal "rate not set" error. */
     if (opt_sample_rate) {
         samp_rate = (double)opt_sample_rate;
-    } else {
+    } else if (samp_rate == 0.0) {
         samp_rate = (double)backend_default_rate(opt_sdr_backend);
     }
-    center_freq = (double)opt_center_freq_hz;
-    if (center_freq != 0.0) return;
+
+    if (opt_center_freq_hz != 0) {
+        center_freq = (double)opt_center_freq_hz;
+        return;
+    }
+    if (center_freq != 0.0) return;  /* adopted from VITA-49 context */
 
     /* Derive: place center at the midpoint of the (region, preset) coverage. */
     const mesh_region_t *r = mesh_lookup_region(opt_region ? opt_region : "US");
@@ -2541,7 +3465,7 @@ static int run_live(void)
                 opt_sample_rate = (uint32_t)m.sample_rate;
             if (m.have_frequency && opt_center_freq_hz == 0)
                 opt_center_freq_hz = (uint64_t)m.frequency_hz;
-            if (m.have_datatype && iq_format == FMT_CI8)
+            if (m.have_datatype && !opt_iq_format_set)
                 iq_format = m.datatype;
             fprintf(stderr, "sigmf: loaded metadata for %s "
                             "(rate=%g freq=%g datatype=%d)\n",
@@ -2666,6 +3590,23 @@ static int run_live(void)
 
     if (verbose) keyset_print(g_keys);
 
+    /* If requested, preload FFTW wisdom so plan creation reuses prior
+     * timing data instead of running FFTW_MEASURE from scratch. Has to
+     * happen before channelizer_create / build_channel_set, both of
+     * which call fftwf_plan_*. Save path is resolved here too so we
+     * can stash it for shutdown without re-deriving. */
+    static char *g_fftw_wisdom_path = NULL;
+    if (opt_fftw_wisdom) {
+        g_fftw_wisdom_path = (*opt_fftw_wisdom)
+            ? strdup(opt_fftw_wisdom)
+            : fftw_wisdom_default_path();
+        if (g_fftw_wisdom_path) fftw_wisdom_load(g_fftw_wisdom_path);
+    }
+
+    /* Opt-in webhook sink. No-op when --webhook-url is unset. */
+    webhook_init(opt_webhook_url, opt_webhook_on, opt_webhook_timeout_ms,
+                 webhook_format_parse(opt_webhook_format));
+
     /* Channelizer + per-channel demods */
     g_channelizer = channelizer_create((uint64_t)center_freq, (uint32_t)samp_rate);
     if (!g_channelizer) { fprintf(stderr, "channelizer_create failed\n"); return 1; }
@@ -2698,16 +3639,27 @@ static int run_live(void)
     if (n > 0)
         fprintf(stderr, "configured %d channel(s) total.\n", n);
 
-    /* Scanner instance for --scan, --scan-and-decode, or --alert-off-grid.
-     * Energy-detector FFT that fires off-grid LoRa-shaped alerts. */
-    if (opt_op_mode != OP_MODE_DECODE || opt_alert_off_grid) {
+    /* Scanner instance for --scan, --scan-and-decode, --alert-off-grid,
+     * or --web-waterfall=on (which needs the scanner's full-passband
+     * FFT to render the Spectrum tab). Energy-detector FFT that fires
+     * off-grid LoRa-shaped alerts; in waterfall-only mode the alert
+     * callback stays unset so the scanner is purely a snapshot source. */
+    bool scanner_for_alerts =
+        opt_op_mode != OP_MODE_DECODE || opt_alert_off_grid;
+    bool scanner_for_waterfall = opt_web_waterfall && opt_web_port > 0;
+    if (scanner_for_alerts || scanner_for_waterfall) {
         g_scanner = scanner_create((uint64_t)center_freq, (uint32_t)samp_rate, 4096);
         if (g_scanner) {
             scanner_set_known_grid(g_scanner, g_grid_freqs, g_grid_bws, g_grid_count);
-            scanner_set_callback(g_scanner, on_off_grid_discovery, NULL);
-            fprintf(stderr, "scanner: enabled with off-grid alerts "
-                            "(4096-bin FFT, excluding %d grid channels)\n",
-                    g_grid_count);
+            if (scanner_for_alerts) {
+                scanner_set_callback(g_scanner, on_off_grid_discovery, NULL);
+                fprintf(stderr, "scanner: enabled with off-grid alerts "
+                                "(4096-bin FFT, excluding %d grid channels)\n",
+                        g_grid_count);
+            } else {
+                fprintf(stderr, "scanner: enabled for waterfall "
+                                "(4096-bin FFT, no off-grid alerts)\n");
+            }
         }
     }
 
@@ -2728,6 +3680,265 @@ static int run_live(void)
                     g_iq_record_target_cs8 ? "cs8 (int8 I/Q)" : "native (raw)",
                     opt_iq_record);
         }
+    }
+
+    /* Resolve deep-decode config from --deep-decode + --focus-*. CLI
+     * values are the canonical source; env vars below are accepted as
+     * power-user overrides but not advertised in --help. Setting
+     * --deep-decode=auto provisions ring + pool with their CLI
+     * defaults; --deep-decode=off (the conservative default) keeps
+     * the wideband-only path byte-identical to pre-Phase-3 main. */
+    if (opt_deep_decode == DEEP_DECODE_AUTO) {
+        g_iq_ring_ms             = (size_t)opt_focus_ring_ms;
+        g_focus_pool_cfg_size    = opt_focus_workers;
+        g_focus_pool_hold_down_s = opt_focus_hold_s;
+        g_focus_pool_rewind_ms   = opt_focus_rewind_ms;
+        g_focus_pool_min_snr_db  = opt_focus_min_snr_db;
+        g_focus_os_factor        = opt_focus_os;
+        /* Parse --focus-freqs CSV (CLI). */
+        if (opt_focus_freqs_csv) {
+            char buf[512];
+            strncpy(buf, opt_focus_freqs_csv, sizeof(buf) - 1);
+            buf[sizeof(buf) - 1] = 0;
+            char *save = NULL;
+            for (char *t = strtok_r(buf, ",", &save); t;
+                 t = strtok_r(NULL, ",", &save)) {
+                if (g_focus_pool_freqs_n >= FOCUS_POOL_FREQS_MAX) break;
+                uint64_t f = strtoull(t, NULL, 10);
+                if (f > 0) g_focus_pool_freqs[g_focus_pool_freqs_n++] = f;
+            }
+        }
+    }
+    /* Hidden env overrides. Operators can still flip these without
+     * touching the CLI; they win over the --deep-decode resolution
+     * above so an operator can disable the pool from outside without
+     * editing the launch command. */
+    {
+        const char *e = getenv("MESHTASTIC_IQ_RING_MS");
+        if (e && *e) {
+            long ms = atol(e);
+            if (ms >= 0 && ms <= 10000) g_iq_ring_ms = (size_t)ms;
+        }
+    }
+
+    /* Snapshot-store env overrides (parity with the other focused-pool envs).
+     * MESHTASTIC_SNAPSHOT_STORE      -- directory; takes effect if no CLI flag.
+     * MESHTASTIC_SNAPSHOT_QUEUE_CAP  -- hidden; overrides the writer queue
+     *                                   capacity (default 64). Exposed so
+     *                                   the queue-overflow drop path is
+     *                                   testable from a stress fixture
+     *                                   without rebuilding. */
+    {
+        const char *e = getenv("MESHTASTIC_SNAPSHOT_STORE");
+        if (e && *e && !opt_snapshot_store_dir) {
+            opt_snapshot_store_dir = strdup(e);
+        }
+    }
+    /* If --snapshot-store is enabled, force the iq-ring on even when
+     * --deep-decode=off: the snapshot writer reads from the ring, not
+     * from a focused worker, so we don't need the pool to be running.
+     * Size the ring to comfortably hold the requested window plus
+     * head-room for writer scheduling jitter (factor 2x the window,
+     * minimum 500 ms). Without this, a configured window equal to or
+     * larger than the ring history budget causes every pre-window
+     * sample to age out before the writer extracts -- counted as
+     * missed_ring_window and visible at shutdown. */
+    if (opt_snapshot_store_dir) {
+        long window_ms = (long)opt_snapshot_window_pre_ms +
+                         (long)opt_snapshot_window_post_ms;
+        long needed_ms = window_ms * 2;
+        if (needed_ms < 500) needed_ms = 500;
+        if (needed_ms > 10000) needed_ms = 10000;
+        if ((long)g_iq_ring_ms < needed_ms) {
+            size_t prev = g_iq_ring_ms;
+            g_iq_ring_ms = (size_t)needed_ms;
+            fprintf(stderr,
+                    "snapshot-store: enabled; iq-ring sized to %zu ms "
+                    "(was %zu ms; window=%ldms; 2x window + head-room).\n",
+                    g_iq_ring_ms, prev, window_ms);
+        }
+    }
+
+    /* Optional manual focused-decoder driven by the ring.
+     * Activated via:
+     *   MESHTASTIC_FOCUS_MANUAL=freq_hz:bw_hz:sf:cr[:start_sample]
+     * (e.g. "906875000:250000:9:5:0"). When set without an explicit ring
+     * size, an iq-ring of 500 ms is auto-provisioned so the worker has
+     * something to pull from. Worker creation itself runs lazily in
+     * process_sample_buf once the ring is allocated. */
+    {
+        const char *fm = getenv("MESHTASTIC_FOCUS_MANUAL");
+        if (fm && *fm && strlen(fm) < sizeof(g_focused_manual_spec)) {
+            strncpy(g_focused_manual_spec, fm,
+                    sizeof(g_focused_manual_spec) - 1);
+            if (g_iq_ring_ms == 0) {
+                g_iq_ring_ms = 500;
+                fprintf(stderr, "focused: MESHTASTIC_FOCUS_MANUAL set; "
+                                "auto-enabling iq-ring at %zu ms.\n",
+                        g_iq_ring_ms);
+            }
+            const char *ssample = strrchr(fm, ':');
+            (void)ssample;  /* parsed when the worker is constructed */
+            fprintf(stderr, "focused: manual spec '%s' queued.\n",
+                    g_focused_manual_spec);
+        }
+    }
+
+    /* Hidden env override for pool allowlist (CSV decimal Hz). */
+    {
+        const char *fl = getenv("MESHTASTIC_FOCUS_POOL_FREQS");
+        if (fl && *fl) {
+            char buf[512];
+            strncpy(buf, fl, sizeof(buf) - 1); buf[sizeof(buf)-1] = 0;
+            char *save = NULL;
+            /* Env overrides: replace, don't append. */
+            g_focus_pool_freqs_n = 0;
+            for (char *t = strtok_r(buf, ",", &save); t;
+                 t = strtok_r(NULL, ",", &save)) {
+                if (g_focus_pool_freqs_n >= FOCUS_POOL_FREQS_MAX) break;
+                uint64_t f = strtoull(t, NULL, 10);
+                if (f > 0) g_focus_pool_freqs[g_focus_pool_freqs_n++] = f;
+            }
+        }
+    }
+
+    /* Hidden env override for the SNR floor (dB). */
+    {
+        const char *e = getenv("MESHTASTIC_FOCUS_MIN_SNR_DB");
+        if (e && *e) g_focus_pool_min_snr_db = atof(e);
+    }
+    /* Hidden env override for focus decoder oversampling. */
+    {
+        const char *e = getenv("MESHTASTIC_FOCUS_OS");
+        if (e && *e) {
+            if (!strcasecmp(e, "auto")) g_focus_os_factor = 0;
+            else {
+                int n = atoi(e);
+                if (n == 1 || n == 2 || n == 4 || n == 8)
+                    g_focus_os_factor = n;
+            }
+        }
+    }
+
+    /* Hidden env override for the pool size + timing trio. */
+    {
+        const char *fp = getenv("MESHTASTIC_FOCUS_POOL");
+        if (fp && *fp) {
+            int n = 0;
+            double hd = g_focus_pool_hold_down_s;
+            int rewind_ms = g_focus_pool_rewind_ms;
+            int nparsed = sscanf(fp, "%d:%lf:%d", &n, &hd, &rewind_ms);
+            if (nparsed >= 1 && n >= 1 && n <= FOCUS_POOL_MAX) {
+                g_focus_pool_cfg_size    = n;
+                g_focus_pool_hold_down_s = hd > 0.0 ? hd : 5.0;
+                g_focus_pool_rewind_ms   = rewind_ms > 0 ? rewind_ms : 20;
+                if (g_iq_ring_ms == 0) g_iq_ring_ms = 500;
+            }
+        }
+    }
+
+    /* Scanner-promoted single-slot focused worker.
+     *   MESHTASTIC_FOCUS_AUTO=freq:bw:sf:cr[:hold_down_s[:rewind_ms]]
+     * The worker is created in non-sticky mode and sits IDLE until a
+     * wideband channel matching (sf, cr, bw_hz, freq) reports a
+     * preamble lock; main.c then arms it at (current_wideband_sample
+     * - rewind_ms * samp_rate). hold_down_s controls how long the
+     * worker stays warm after activity quiets (default 5s). */
+    {
+        const char *fa = getenv("MESHTASTIC_FOCUS_AUTO");
+        if (fa && *fa && strlen(fa) < sizeof(g_focused_auto_spec)) {
+            strncpy(g_focused_auto_spec, fa, sizeof(g_focused_auto_spec) - 1);
+            long long freq_hz = 0, bw_hz = 0;
+            int sf = 0, cr = 0;
+            double hd = 5.0;
+            int    rewind_ms = 10;
+            int nparsed = sscanf(g_focused_auto_spec,
+                                 "%lld:%lld:%d:%d:%lf:%d",
+                                 &freq_hz, &bw_hz, &sf, &cr,
+                                 &hd, &rewind_ms);
+            if (nparsed >= 4 && sf >= 7 && sf <= 12 && cr >= 5 && cr <= 8
+                && bw_hz > 0 && freq_hz > 0) {
+                g_focused_auto_freq_hz = (double)freq_hz;
+                g_focused_auto_bw_hz   = (int)bw_hz;
+                g_focused_auto_sf      = sf;
+                g_focused_auto_cr      = cr;
+                g_focused_auto_hold_down_s = hd > 0.0 ? hd : 5.0;
+                /* rewind window in samples at the SDR rate; computed
+                 * later when samp_rate is known. Stash ms here. */
+                g_focused_auto_rewind_samples = (uint64_t)rewind_ms;
+                if (g_iq_ring_ms == 0) g_iq_ring_ms = 500;
+                fprintf(stderr,
+                        "focused: auto spec '%s' queued "
+                        "(freq=%.3fMHz BW=%d SF=%d CR=4/%d "
+                        "hold_down=%.1fs rewind=%dms)\n",
+                        g_focused_auto_spec, (double)freq_hz / 1e6,
+                        (int)bw_hz, sf, cr, hd, rewind_ms);
+            } else {
+                fprintf(stderr, "focused: bad MESHTASTIC_FOCUS_AUTO spec '%s'\n",
+                        g_focused_auto_spec);
+                g_focused_auto_spec[0] = 0;
+            }
+        }
+    }
+
+    /* Startup coverage banner. Tells the operator exactly what the
+     * receiver is set up to do -- region/presets covered, deep-decode
+     * mode, output filtering -- so they know what "all Meshtastic"
+     * means for this run instead of having to infer it from the
+     * later stats stream. */
+    {
+        double low_mhz  = ((double)center_freq - samp_rate * 0.5) / 1e6;
+        double high_mhz = ((double)center_freq + samp_rate * 0.5) / 1e6;
+        fprintf(stderr,
+                "[coverage] center=%.3fMHz rate=%.3fMsps region=%s presets=%s\n",
+                (double)center_freq / 1e6, samp_rate / 1e6,
+                opt_region ? opt_region : "(default)",
+                opt_preset_csv ? opt_preset_csv : "LongFast");
+        fprintf(stderr,
+                "[coverage] scan: %.3f-%.3fMHz, %d channel(s) configured\n",
+                low_mhz, high_mhz, n);
+        if (opt_deep_decode == DEEP_DECODE_AUTO) {
+            fprintf(stderr,
+                    "[coverage] deep-decode: auto, workers=%d, ring=%dms, "
+                    "rewind=%dms, hold=%.1fs, min-snr=%.1fdB, focus-os=%s%s\n",
+                    g_focus_pool_cfg_size, (int)g_iq_ring_ms,
+                    g_focus_pool_rewind_ms, g_focus_pool_hold_down_s,
+                    g_focus_pool_min_snr_db,
+                    g_focus_os_factor == 0 ? "auto" :
+                    (g_focus_os_factor == 1 ? "1" :
+                     g_focus_os_factor == 2 ? "2" :
+                     g_focus_os_factor == 4 ? "4" : "8"),
+                    g_focus_pool_freqs_n > 0 ? ", allowlisted" : "");
+            if (g_focus_pool_freqs_n > 0) {
+                fprintf(stderr, "[coverage] focus-freqs:");
+                for (int i = 0; i < g_focus_pool_freqs_n; ++i)
+                    fprintf(stderr, " %.3fMHz",
+                            (double)g_focus_pool_freqs[i] / 1e6);
+                fputc('\n', stderr);
+            }
+        } else {
+            fprintf(stderr,
+                    "[coverage] deep-decode: off (wideband only). "
+                    "Pass --deep-decode=auto to wake focused workers.\n");
+        }
+        if (opt_snapshot_store_dir) {
+            double min_snr = opt_snapshot_min_snr_db >= 0.0
+                             ? opt_snapshot_min_snr_db
+                             : opt_focus_min_snr_db;
+            fprintf(stderr,
+                    "[coverage] snapshot-store: dir=%s window=%dms+%dms "
+                    "disk_cap=%lldMB age_cap=%llds min_snr=%.1fdB\n",
+                    opt_snapshot_store_dir,
+                    opt_snapshot_window_pre_ms,
+                    opt_snapshot_window_post_ms,
+                    opt_snapshot_disk_mb, opt_snapshot_age_s, min_snr);
+        }
+        fprintf(stderr,
+                "[output] %s%s%s\n",
+                opt_trusted_only ? "confirmed events only (--trusted-only)"
+                                 : "all events (CRC pass + fails)",
+                opt_show_untrusted ? " + show-untrusted" : "",
+                opt_diagnostics    ? " + diagnostics"    : "");
     }
 
     feed_init();
@@ -2809,6 +4020,30 @@ static int run_live(void)
         web_shutdown();
     pthread_join(input_tid, NULL);
     sample_pipeline_stop();
+    /* Drain + stop the manual focused worker BEFORE the channelizer
+     * flushes and the dedup drainer stops, so any tail frames the
+     * worker emits make it through dedup like wideband frames. */
+    if (g_focused_manual) {
+        focused_worker_stop_and_join(g_focused_manual);
+    }
+    if (g_focused_auto) {
+        focused_worker_stop_and_join(g_focused_auto);
+        fprintf(stderr, "focused: auto arm_count=%llu over the run.\n",
+                (unsigned long long)atomic_load(&g_focused_auto_arm_count));
+    }
+    if (g_focus_pool_size > 0) {
+        for (int i = 0; i < g_focus_pool_size; ++i) {
+            if (g_focus_pool[i]) focused_worker_stop_and_join(g_focus_pool[i]);
+        }
+        fprintf(stderr,
+                "focus-pool: promotions total=%llu matched_existing=%llu "
+                "assigned_idle=%llu dropped_busy=%llu below_snr=%llu\n",
+                (unsigned long long)atomic_load(&g_focus_pool_promote_total),
+                (unsigned long long)atomic_load(&g_focus_pool_promote_matched),
+                (unsigned long long)atomic_load(&g_focus_pool_promote_assigned),
+                (unsigned long long)atomic_load(&g_focus_pool_promote_dropped),
+                (unsigned long long)atomic_load(&g_focus_pool_promote_below_snr));
+    }
     pthread_join(stats_tid, NULL);
     pthread_join(wd_tid, NULL);
 
@@ -2858,6 +4093,67 @@ static int run_live(void)
     }
     channelizer_destroy(g_channelizer); g_channelizer = NULL;
     if (g_scanner) { scanner_destroy(g_scanner); g_scanner = NULL; }
+    if (g_focused_manual) {
+        focused_worker_destroy(g_focused_manual);
+        g_focused_manual = NULL;
+    }
+    if (g_focused_auto) {
+        focused_worker_destroy(g_focused_auto);
+        g_focused_auto = NULL;
+    }
+    for (int i = 0; i < g_focus_pool_size; ++i) {
+        if (g_focus_pool[i]) {
+            focused_worker_destroy(g_focus_pool[i]);
+            g_focus_pool[i] = NULL;
+        }
+    }
+    g_focus_pool_size = 0;
+    /* Webhook worker thread flushes in-flight POSTs against its per-
+     * request timeout and exits. Has to run before stdio shutdown so
+     * the 'webhook: ...' farewell line still makes it to stderr. */
+    webhook_stop();
+    /* All FFTW plans have been destroyed at this point; the planner state
+     * still in memory is what we want to persist for the next run. */
+    if (g_fftw_wisdom_path) {
+        fftw_wisdom_save(g_fftw_wisdom_path);
+        free(g_fftw_wisdom_path);
+        g_fftw_wisdom_path = NULL;
+    }
+    if (g_iq_ring) {
+        uint64_t total = iq_ring_total_appended(g_iq_ring);
+        uint64_t oldest, newest;
+        iq_ring_live_range(g_iq_ring, &oldest, &newest);
+        fprintf(stderr,
+                "iq-ring: %llu samples appended over the run, live range "
+                "[%llu .. %llu) at shutdown (%zu-sample capacity).\n",
+                (unsigned long long)total,
+                (unsigned long long)oldest,
+                (unsigned long long)newest,
+                g_iq_ring_capacity_samples);
+        /* Stop snapshot writer before destroying the ring it reads from.
+         * Shutdown drains any items still in the queue, so the counter
+         * snapshot AFTER shutdown reflects the final post-drain state
+         * (rather than the pre-drain state that misses last-batch
+         * writes on short fixtures). */
+        if (iq_snapshot_enabled()) {
+            iq_snapshot_shutdown();
+            iq_snapshot_counters_t sc;
+            iq_snapshot_get_counters(&sc);
+            fprintf(stderr,
+                    "snapshot-store: enqueued=%llu kept=%llu pruned=%llu "
+                    "dropped_queue_full=%llu dropped_below_snr=%llu "
+                    "wait_timeout=%llu missed_ring=%llu\n",
+                    (unsigned long long)sc.enqueued_total,
+                    (unsigned long long)sc.kept,
+                    (unsigned long long)sc.pruned,
+                    (unsigned long long)sc.dropped_queue_full,
+                    (unsigned long long)sc.dropped_below_snr,
+                    (unsigned long long)sc.wait_timeout,
+                    (unsigned long long)sc.missed_ring_window);
+        }
+        iq_ring_destroy(g_iq_ring);
+        g_iq_ring = NULL;
+    }
     keyset_destroy(g_keys);             g_keys = NULL;
     return 0;
 }
@@ -2902,6 +4198,31 @@ int main(int argc, char **argv)
     if (rc == 105) {              /* --selftest-rejection-procgain */
         extern int run_selftest_rejection_procgain(void);
         return run_selftest_rejection_procgain();
+    }
+
+    /* Workaround: serialise sink-worker dispatch when the experimental
+     * oversampled PFB is going to be used (MESHTASTIC_OS_POLICY=auto or
+     * MESHTASTIC_PROTOTYPE_OS>1). Multi-worker dispatch has a concurrency
+     * bug when 2+ sinks share an os>1 PFB group -- cluster2 real-RF
+     * decodes 1-2 of 4 expected packets nondeterministically at 8 workers,
+     * 4 of 4 at 1 worker. The wall-time cost of serialising on the
+     * oversampled path is ~2%; the sample-pump producer is the bottleneck
+     * regardless. Default os=1 production runs leave the env vars unset
+     * and never enter this branch, so the full worker pool stays active
+     * for the critically-sampled path. The user can still override by
+     * setting MESHTASTIC_SINK_WORKERS explicitly. This is a correctness
+     * workaround, not the final root-cause fix. */
+    {
+        const char *pol = getenv("MESHTASTIC_OS_POLICY");
+        const char *po  = getenv("MESHTASTIC_PROTOTYPE_OS");
+        int os_active = (pol && !strcmp(pol, "auto")) ||
+                        (po && atoi(po) > 1);
+        if (os_active && !getenv("MESHTASTIC_SINK_WORKERS")) {
+            setenv("MESHTASTIC_SINK_WORKERS", "1", 0);
+            fprintf(stderr,
+                    "note: forcing MESHTASTIC_SINK_WORKERS=1 because an "
+                    "os>1 PFB path is enabled (avoids multi-worker race).\n");
+        }
     }
 
     fprintf(stderr,
@@ -2963,6 +4284,15 @@ int main(int argc, char **argv)
 #ifdef HAVE_UHD
         fprintf(stdout, "[usrp]\n");    usrp_backend_list();
 #endif
+        /* Vendor SDR libraries (notably SDRplay's API) register atexit
+         * handlers that emit munmap/free warnings on process exit
+         * when they were Open'd but no physical device was found. The
+         * messages fire AFTER main returns, so we silence stderr at
+         * the last moment to keep --list output clean. Flush stdout
+         * first so the actual device list is committed before the
+         * descriptor closes. */
+        fflush(stdout);
+        fclose(stderr);
         return 0;
     }
 

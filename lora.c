@@ -36,6 +36,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -423,6 +424,16 @@ struct lora_decoder {
     /* State machine. */
     lora_state_t state;
     int          preamble_count;
+    /* Running sum + count of dechirped peak magnitudes across matched
+     * preamble ticks. Used to detect window-straddle ticks where the
+     * argmax bin still lands on the preamble bin but the peak magnitude
+     * drops to ~sinc(0.5) of the preamble mean (= the FFT window is
+     * straddling the preamble/sync chirp boundary). Such ticks must
+     * trigger the sync transition even though their bin matches, or
+     * we over-count preamble by one symbol and read the header one
+     * symbol late -- the os_factor>=2 SFO=0 baseline failure. */
+    double       preamble_peak_sum;
+    int          preamble_peak_count;
     /* Set the first time preamble_count crosses PREAMBLE_MIN within one
      * STATE_PREAMBLE_OK run; cleared on every IDLE->PREAMBLE_OK entry.
      * Lets the stats counter record one "lock" per preamble rather than
@@ -438,6 +449,11 @@ struct lora_decoder {
     int          preamble_bin_hist[16];
     int          preamble_bin_hist_count;
     int          sto_skip_remaining; /* gr-lora_sdr-style k_hat realignment after preamble lock */
+    /* One-shot per-symbol consume adjust set by SFO drift code. +1 means
+     * the next symbol's FFT window starts 1 sample EARLIER (carry the
+     * current symbol's last sample forward across the symbuf reset).
+     * -1 means start 1 sample LATER (one extra sto-skip). 0 = no shift. */
+    int          sfo_next_sym_shift;
     uint16_t     header_syms[8];
     int          header_idx;
 
@@ -481,6 +497,28 @@ struct lora_decoder {
     float        header_llrs[8][LLR_PER_SYMBOL];
     float        payload_llrs[MAX_PAYLOAD_SYMBOLS][LLR_PER_SYMBOL];
 
+    /* SFO/STO sub-bin tracking, gr-lora_sdr frame_sync_impl.cc port.
+     * Set via lora_decoder_set_center_freq(); when 0 the SFO compensation
+     * paths are inert and the decoder behaves as before. */
+    double         center_freq_hz;
+    /* Per-payload-symbol drift accumulator (fractional samples). Per gr-lora
+     * sfo_cum += sfo_hat; when |sfo_cum| > 1/(2*os_factor), one sample is
+     * dropped or added before the next FFT and sfo_cum is decremented by
+     * 1/os_factor. */
+    double         sfo_cum;
+    double         sfo_hat;       /* drift per payload symbol; set at DC2 */
+    float          sto_frac;      /* RCTSL sub-bin estimate at lock time */
+    /* Rolling buffer of the last K dechirped preamble symbols, used by
+     * RCTSL. Allocated when center_freq_hz is set. */
+    float complex *preamble_dechirped;
+    int            preamble_dechirped_capacity; /* K */
+    int            preamble_dechirped_count;
+    int            preamble_dechirped_next;     /* next slot to fill (ring) */
+    /* 2N-point FFT for RCTSL (zero-padded for sub-bin resolution). */
+    fftwf_complex *fft2_in;
+    fftwf_complex *fft2_out;
+    fftwf_plan     fft2_plan;
+
     /* Per-frame metadata, updated as we go. */
     lora_frame_meta_t meta;
     /* Running SNR accumulator across the header + payload symbols.
@@ -489,8 +527,36 @@ struct lora_decoder {
     double            snr_db_sum;
     int               snr_db_count;
 
+    /* Frame-sync trace fields (gated by MESHTASTIC_DEBUG_FRAMESYNC env).
+     * Behavior-inert when the env flag is unset; only the bookkeeping
+     * happens (one int increment per delivered/aborted frame, eight
+     * float writes per header). Used for side-by-side comparison with
+     * gr-lora_sdr's frame_sync_impl.cc on the same input file. */
+    int               framesync_frame_idx;   /* monotonic per-decoder */
+    int               framesync_k_hat;       /* preamble mode bin at lock */
+    int               framesync_sto_skip;    /* sto_skip set at lock */
+    int               framesync_dc2_down_val;
+    int               framesync_trim_input;
+    int               framesync_header_bins[8];
+    float             framesync_header_mags[8];
+
     lora_frame_cb_t cb;
     void           *user;
+
+    lora_preamble_cb_t preamble_cb;
+    void              *preamble_user;
+
+    /* TDOA stream cursor (caller-opaque). Set per feed batch via
+     * lora_decoder_set_stream_cursor. samples_in_chunk counts samples
+     * passed through this feed batch (both skipped-by-sto and accepted
+     * into symbuf). At preamble lock fire, the field
+     *     meta.preamble_lock_sample_idx = stream_chunk_anchor +
+     *         samples_in_chunk * stream_step_per_sample
+     * is stamped on the per-decoder meta struct so the next frame
+     * delivered to the frame callback inherits the lock-time anchor. */
+    uint64_t stream_chunk_anchor;
+    uint32_t stream_step_per_sample;
+    uint32_t samples_in_chunk;
 };
 
 /* ---- Reference chirps ----
@@ -500,6 +566,23 @@ struct lora_decoder {
  * (continuous chirp from -BW/2 to +BW/2 over N samples)
  *
  * The downchirp for dechirping is the complex conjugate. */
+
+/* Cached one-shot read of MESHTASTIC_DEBUG_FRAMESYNC: when set to "1"
+ * the decoder emits per-frame side-by-side-with-gr-lora trace lines
+ * tagged "[fs]" on stderr. Unset (default) is a no-op: the env getenv
+ * is paid once per process, then a static int gate is consulted. */
+static int framesync_enabled(void)
+{
+    static _Atomic int cached = -1;
+    int v = atomic_load_explicit(&cached, memory_order_acquire);
+    if (v < 0) {
+        const char *e = getenv("MESHTASTIC_DEBUG_FRAMESYNC");
+        v = (e && e[0] == '1') ? 1 : 0;
+        atomic_store_explicit(&cached, v, memory_order_release);
+    }
+    return v;
+}
+
 static void build_chirps(fftwf_complex *up, fftwf_complex *down, int N)
 {
     /* Reference chirp formula matches gr-lora_sdr utilities.h
@@ -569,6 +652,49 @@ void lora_decoder_set_callback(lora_decoder_t *d, lora_frame_cb_t cb, void *user
     d->cb = cb; d->user = user;
 }
 
+void lora_decoder_set_stream_cursor(lora_decoder_t *d, uint64_t chunk_anchor,
+                                    uint32_t step_per_sample)
+{
+    if (!d) return;
+    d->stream_chunk_anchor    = chunk_anchor;
+    d->stream_step_per_sample = step_per_sample;
+    d->samples_in_chunk       = 0;
+}
+
+void lora_decoder_set_preamble_cb(lora_decoder_t *d, lora_preamble_cb_t cb, void *user)
+{
+    if (!d) return;
+    d->preamble_cb = cb; d->preamble_user = user;
+}
+
+/* Number of preamble upchirps to average for the RCTSL estimator. gr-lora_sdr
+ * uses (preamble_len - 3); Meshtastic preambles are 8 symbols so 5 fits but
+ * 4 is a good compromise that keeps the per-decoder buffer modest at SF12. */
+#define PREAMBLE_DECHIRPED_K 4
+
+void lora_decoder_set_center_freq(lora_decoder_t *d, double center_freq_hz)
+{
+    if (!d) return;
+    d->center_freq_hz = center_freq_hz;
+    if (center_freq_hz <= 0.0) return;
+    /* Lazy-allocate the SFO compensation buffers on first set. */
+    if (!d->preamble_dechirped) {
+        d->preamble_dechirped_capacity = PREAMBLE_DECHIRPED_K;
+        d->preamble_dechirped = calloc((size_t)PREAMBLE_DECHIRPED_K * d->N,
+                                       sizeof(float complex));
+    }
+    if (!d->fft2_in) {
+        d->fft2_in  = fftwf_alloc_complex((size_t)2 * d->N);
+        d->fft2_out = fftwf_alloc_complex((size_t)2 * d->N);
+        if (d->fft2_in && d->fft2_out) {
+            fftw_planner_lock();
+            d->fft2_plan = fftwf_plan_dft_1d(2 * d->N, d->fft2_in, d->fft2_out,
+                                             FFTW_FORWARD, FFTW_ESTIMATE);
+            fftw_planner_unlock();
+        }
+    }
+}
+
 void lora_decoder_destroy(lora_decoder_t *d)
 {
     if (!d) return;
@@ -577,10 +703,18 @@ void lora_decoder_destroy(lora_decoder_t *d)
         fftwf_destroy_plan(d->fft_plan);
         fftw_planner_unlock();
     }
+    if (d->fft2_plan) {
+        fftw_planner_lock();
+        fftwf_destroy_plan(d->fft2_plan);
+        fftw_planner_unlock();
+    }
     fftwf_free(d->downchirp);
     fftwf_free(d->upchirp);
     fftwf_free(d->fft_in);
     fftwf_free(d->fft_out);
+    if (d->fft2_in)  fftwf_free(d->fft2_in);
+    if (d->fft2_out) fftwf_free(d->fft2_out);
+    free(d->preamble_dechirped);
     free(d->symbuf);
     free(d);
 }
@@ -588,15 +722,20 @@ void lora_decoder_destroy(lora_decoder_t *d)
 /* ---- DSP helpers ----
  *
  * When os_factor > 1, the symbol buffer holds N*os samples per symbol.
- * We need to pick N samples with a sub-sample offset (the "phase") for
- * dechirp+FFT. The phase is chosen during preamble lock to align the
- * sampling grid with the chirp boundaries -- without this, real-radio
- * captures land each chirp at a fractional offset that smears the FFT
- * peak and breaks decode.
+ * Pick N samples with two layers of sub-sample correction for
+ * dechirp+FFT.
  *
- * Picks samples at indices os/2 + os*k - phase, k=0..N-1. Phase comes
- * from d->sto_offset, set during preamble lock. For os_factor=1 this
- * collapses to a memcpy (phase always 0). */
+ * Picks samples at indices os/2 + os*k - phase - fine, k=0..N-1.
+ *   phase = d->sto_offset (integer, 0..os-1), chosen by the phase
+ *           scan in state_tick at IDLE / first PREAMBLE_OK tick.
+ *   fine  = lrintf(sto_frac * os_factor), the per-symbol sub-output-
+ *           sample STO correction in INPUT samples. sto_frac is the
+ *           RCTSL fractional estimate set at preamble lock
+ *           (compute_sto_frac, range [-0.5, +0.5] output samples).
+ *           Ports gr-lora_sdr frame_sync_impl.cc:501.
+ *
+ * For os_factor=1 the early return makes this a memcpy. fine is also
+ * 0 there since sto_frac in [-0.5, +0.5] times 1 rounds to 0. */
 static inline const float complex *
 downsample_symbol(lora_decoder_t *d, const float complex *src, int phase,
                   float complex *scratch)
@@ -606,8 +745,29 @@ downsample_symbol(lora_decoder_t *d, const float complex *src, int phase,
     int half = os / 2;
     if (phase < 0) phase = 0;
     if (phase >= os) phase = os - 1;
+    /* Sub-output-sample STO correction (gr-lora_sdr frame_sync_impl.cc:501).
+     * At os=2: lrint of sto_frac in [-0.5, +0.5] * 2 = {-1, 0, +1} input
+     * samples (= ±0.5 output samples). At os=4: {-2, -1, 0, +1, +2}
+     * input samples. Without this, the integer phase pick leaves up to
+     * 1 input sample of residue at os=2; at SFO-induced fractional
+     * symbol-boundary positions that residue manifests as a 1-bin
+     * header dechirp shift. */
+    /* Continuous in-frame STO tracking: the static RCTSL sto_frac is the
+     * timing residual at preamble lock; sfo_cum is the drift accumulated
+     * since DC2 (sfo_cum += sfo_hat per symbol, state_tick tail). Folding
+     * sfo_cum into the per-symbol fine shift re-centres the dechirp window
+     * as the sample clock drifts across the frame -- the static one-shot
+     * sto_frac alone leaves the frame tail ~0.4 output samples off at
+     * SF9 SFO=25, smearing the last payload symbols off the bin grid.
+     *
+     * Complementary to the integer-sample carry-back below (not double
+     * counting): when the carry-back fires it advances the window +1 input
+     * sample AND decrements sfo_cum by 1/os, so this lrint drops by exactly
+     * 1 input sample -- net correction stays sto_frac + total_drift either
+     * way. At SFO=0 sfo_hat=0 so sfo_cum stays 0 and this is inert. */
+    int fine = (int)lrintf((d->sto_frac + (float)d->sfo_cum) * (float)os);
     for (int k = 0; k < d->N; ++k) {
-        int idx = half + os * k - phase;
+        int idx = half + os * k - phase - fine;
         if (idx < 0) idx = 0;
         if (idx >= d->samples_per_symbol) idx = d->samples_per_symbol - 1;
         scratch[k] = src[idx];
@@ -626,12 +786,29 @@ static uint16_t demod_one_symbol_full(lora_decoder_t *d,
                                       float *peak_mag, float *noise_mag,
                                       int capture_bin, float complex *bin_capture)
 {
-    /* Multiply by downchirp (s[n] * conj(upchirp[n])) */
+    /* CFO-compensated dechirp. Per gr-lora_sdr frame_sync_impl.cc:631-634,
+     * CFO compensation lives on the SAMPLE side, not in a mutated chirp
+     * reference. We pre-rotate the input by exp(-j*2*pi*cfo_bins*n/N)
+     * where cfo_bins = cfo_int + cfo_frac, then dechirp by the CANONICAL
+     * downchirp. Mathematically equivalent to mutating the chirp; in
+     * practice the chirp-mutation approach didn't actually shift the
+     * FFT argmax bin in our pipeline (verified 2026-05-27 via
+     * choke-point trace). Sample rotation does. */
     float complex *fft_in_c  = (float complex *)d->fft_in;
     float complex *fft_out_c = (float complex *)d->fft_out;
     float complex *down_c    = (float complex *)d->downchirp;
-    for (int n = 0; n < d->N; ++n)
-        fft_in_c[n] = s[n] * down_c[n];
+    double cfo_bins = (double)d->cfo_int + (double)d->cfo_frac;
+    if (cfo_bins != 0.0) {
+        double k = -2.0 * M_PI * cfo_bins / (double)d->N;
+        for (int n = 0; n < d->N; ++n) {
+            double ph = k * (double)n;
+            float complex rot = (float)cos(ph) + I * (float)sin(ph);
+            fft_in_c[n] = s[n] * rot * down_c[n];
+        }
+    } else {
+        for (int n = 0; n < d->N; ++n)
+            fft_in_c[n] = s[n] * down_c[n];
+    }
     fftwf_execute(d->fft_plan);
 
     float best = 0.0f; int best_bin = 0;
@@ -695,8 +872,7 @@ static int demod_downchirp_argmax(lora_decoder_t *d, const float complex *s)
                 crealf(s[2]), cimagf(s[2]), crealf(s[3]), cimagf(s[3]),
                 crealf(up_c[0]), cimagf(up_c[0]), crealf(up_c[1]), cimagf(up_c[1]),
                 crealf(up_c[2]), cimagf(up_c[2]), crealf(up_c[3]), cimagf(up_c[3]));
-            /* Also show second/third peak to see if there's spectral splitting. */
-            float p2 = 0; int b2 = 0, p3 = 0, b3 = 0;
+            /* Also show second peak to see if there's spectral splitting. */
             float pf = 0; int bf = 0;
             for (int k = 0; k < d->N; ++k) {
                 float r = crealf(fft_out_c[k]), im = cimagf(fft_out_c[k]);
@@ -724,32 +900,11 @@ static int demod_downchirp_argmax(lora_decoder_t *d, const float complex *s)
  * cfo_frac phase ramp e^{-j*2*pi*cfo_frac/N * n}. */
 static void apply_cfo_correction(lora_decoder_t *d)
 {
-    float complex *u    = (float complex *)d->upchirp;
-    float complex *down = (float complex *)d->downchirp;
-    int id = d->cfo_int;
-    int n_fold_i = d->N - id;  /* may be negative for negative cfo_int */
-    double inv_N = 1.0 / (double)d->N;
-    for (int n = 0; n < d->N; ++n) {
-        double offset = (n < n_fold_i)
-            ? ((double)id * inv_N - 0.5)
-            : ((double)id * inv_N - 1.5);
-        double phase = 2.0 * M_PI * ((double)n * (double)n * 0.5 * inv_N + offset * (double)n);
-        float complex up_n = (float complex)(cos(phase) + I * sin(phase));
-        u[n] = up_n;
-        double frac_phase = -2.0 * M_PI * (double)d->cfo_frac * (double)n * inv_N;
-        float complex frac_tw = (float complex)(cos(frac_phase) + I * sin(frac_phase));
-        down[n] = conjf(up_n) * frac_tw;
-    }
-    {
-        const char *e = getenv("MESHTASTIC_DEBUG_DUMP_DOWN");
-        if (e && *e == '1') {
-            fprintf(stderr, "[lora] apply_cfo_correction: id=%d frac=%.6f n_fold=%d -- down[0..7] =", id, (double)d->cfo_frac, n_fold_i);
-            for (int n = 0; n < 8; ++n) {
-                fprintf(stderr, " (%+0.4f%+0.4fi)", crealf(down[n]), cimagf(down[n]));
-            }
-            fprintf(stderr, "\n");
-        }
-    }
+    /* No-op. CFO correction now lives in demod_one_symbol_full as a
+     * per-sample input rotation. The chirp references stay canonical
+     * across the frame's lifetime; reset_to_idle still rebuilds them
+     * defensively. */
+    (void)d;
 }
 
 /* ---- Soft-decision LLR computation ----
@@ -781,8 +936,20 @@ static void compute_symbol_llrs(lora_decoder_t *d,
     float complex *fft_in_c  = (float complex *)d->fft_in;
     float complex *fft_out_c = (float complex *)d->fft_out;
     float complex *down_c    = (float complex *)d->downchirp;
-    for (int n = 0; n < d->N; ++n)
-        fft_in_c[n] = s[n] * down_c[n];
+    /* Same per-sample CFO pre-rotation as demod_one_symbol_full so the
+     * soft-decode path's LLRs use a properly compensated FFT. */
+    double cfo_bins = (double)d->cfo_int + (double)d->cfo_frac;
+    if (cfo_bins != 0.0) {
+        double k = -2.0 * M_PI * cfo_bins / (double)d->N;
+        for (int n = 0; n < d->N; ++n) {
+            double ph = k * (double)n;
+            float complex rot = (float)cos(ph) + I * (float)sin(ph);
+            fft_in_c[n] = s[n] * rot * down_c[n];
+        }
+    } else {
+        for (int n = 0; n < d->N; ++n)
+            fft_in_c[n] = s[n] * down_c[n];
+    }
     fftwf_execute(d->fft_plan);
 
     /* Per-bin |Y|^2 as max-log likelihood. */
@@ -888,6 +1055,8 @@ static void reset_to_idle(lora_decoder_t *d)
     d->preamble_locked_once = 0;
     d->preamble_fft_count = 0;
     d->preamble_bin_hist_count = 0;
+    d->preamble_peak_sum  = 0.0;
+    d->preamble_peak_count = 0;
     d->header_idx         = 0;
     d->sto_skip_remaining = 0;
     d->hdr_leftover_count = 0;
@@ -898,6 +1067,12 @@ static void reset_to_idle(lora_decoder_t *d)
     d->cfo_frac           = 0.0f;
     d->snr_db_sum         = 0.0;
     d->snr_db_count       = 0;
+    d->sfo_cum            = 0.0;
+    d->sfo_hat            = 0.0;
+    d->sto_frac           = 0.0f;
+    d->sfo_next_sym_shift = 0;
+    d->preamble_dechirped_count = 0;
+    d->preamble_dechirped_next  = 0;
     /* Rebuild the chirp references to id=0. apply_cfo_correction
      * (called at DC2) mutates d->upchirp and d->downchirp in place
      * to bake the just-measured cfo_int into the reference. Without
@@ -912,6 +1087,70 @@ static void reset_to_idle(lora_decoder_t *d)
      * with the drift-across-payload signature -- because the chirp
      * references stayed mutated from the first frame's cfo_int. */
     build_chirps(d->upchirp, d->downchirp, d->N);
+}
+
+/* RCTSL (Rational Combined Three Spectral Line) fractional STO estimator.
+ *
+ * Ported from gr-lora_sdr frame_sync_impl.cc:254-320 (estimate_STO_frac).
+ * Algorithm: zero-pad each saved dechirped preamble symbol to 2N samples,
+ * FFT it, accumulate per-bin |Y|^2 across all saved symbols, find the
+ * argmax k0 across the 2N-point averaged spectrum, then apply the
+ * Cui Yang interpolation formula on three adjacent spectral lines:
+ *
+ *   u = 64*N / 406.5506497
+ *   v = u * 2.4674
+ *   wa = (Y[+1] - Y[-1]) / ( u*(Y[+1]+Y[-1]) + v*Y[0] )
+ *   ka = wa * N / pi
+ *   k_residual = ((k0 + ka)/2) mod 1
+ *   sto_frac = k_residual - (k_residual > 0.5 ? 1 : 0)
+ *
+ * Result is in [-0.5, +0.5] -- sub-bin fractional STO offset. Stored on
+ * the decoder for downstream use; we don't currently apply it as a
+ * sample-shift (would require os_factor>=2). For os_factor=1 channelizer
+ * output this still measures the offset so future work can fold it into
+ * the FFT phase-rotation path. */
+static void compute_sto_frac(lora_decoder_t *d)
+{
+    if (!d->preamble_dechirped || d->preamble_dechirped_count == 0 ||
+        !d->fft2_plan) {
+        d->sto_frac = 0.0f;
+        return;
+    }
+    const int N  = d->N;
+    const int M2 = 2 * N;
+    /* Accumulate |Y|^2 across saved symbols. */
+    static double mag_sq[2 * MAX_FFT];
+    for (int j = 0; j < M2; ++j) mag_sq[j] = 0.0;
+    for (int s = 0; s < d->preamble_dechirped_count; ++s) {
+        const float complex *sym = &d->preamble_dechirped[(size_t)s * N];
+        float complex *in = (float complex *)d->fft2_in;
+        for (int i = 0; i < N;  ++i) in[i] = sym[i];
+        for (int i = N; i < M2; ++i) in[i] = 0.0f + 0.0f * I;
+        fftwf_execute(d->fft2_plan);
+        const float complex *out = (const float complex *)d->fft2_out;
+        for (int j = 0; j < M2; ++j) {
+            float r = crealf(out[j]), im = cimagf(out[j]);
+            mag_sq[j] += (double)(r * r + im * im);
+        }
+    }
+    /* argmax */
+    int k0 = 0;
+    double peak = mag_sq[0];
+    for (int j = 1; j < M2; ++j) {
+        if (mag_sq[j] > peak) { peak = mag_sq[j]; k0 = j; }
+    }
+    /* Three spectral lines (wrap-around). */
+    double Y_1 = mag_sq[(k0 - 1 + M2) % M2];
+    double Y0  = mag_sq[k0];
+    double Y1  = mag_sq[(k0 + 1) % M2];
+    double u = 64.0 * (double)N / 406.5506497;
+    double v = u * 2.4674;
+    double denom = u * (Y1 + Y_1) + v * Y0;
+    double wa = (denom != 0.0) ? (Y1 - Y_1) / denom : 0.0;
+    double ka = wa * (double)N / M_PI;
+    double k_residual = fmod(((double)k0 + ka) / 2.0, 1.0);
+    if (k_residual < 0) k_residual += 1.0;
+    d->sto_frac = (float)(k_residual - (k_residual > 0.5 ? 1.0 : 0.0));
 }
 
 /* Run the state machine for one accumulated symbol. */
@@ -965,13 +1204,18 @@ static void state_tick(lora_decoder_t *d)
      * in the env (legacy) or -vvv on the command line. Useful for cross-
      * validating against the upstream RX. */
     extern int verbose;
-    static int trace_check = 0, trace_on = 0, trace_count = 0;
-    if (!trace_check) {
+    static _Atomic int trace_check = 0;
+    static _Atomic int trace_on    = 0;
+    static _Atomic int trace_count = 0;
+    if (!atomic_load_explicit(&trace_check, memory_order_acquire)) {
         const char *e = getenv("MESHTASTIC_LORA_TRACE");
-        trace_on = (e && *e == '1') || (verbose >= 3);
-        trace_check = 1;
+        atomic_store_explicit(&trace_on,
+                              (e && *e == '1') || (verbose >= 3),
+                              memory_order_relaxed);
+        atomic_store_explicit(&trace_check, 1, memory_order_release);
     }
-    if (trace_on && trace_count++ < 2000) {
+    if (atomic_load_explicit(&trace_on, memory_order_relaxed) &&
+        atomic_fetch_add_explicit(&trace_count, 1, memory_order_relaxed) < 2000) {
         fprintf(stderr, "[lora] state=%d sym=%u peak=%.2f snr=%.2f\n",
                 d->state, sym, peak, peak / (noise > 0 ? noise : 1));
     }
@@ -995,6 +1239,8 @@ static void state_tick(lora_decoder_t *d)
         d->preamble_fft_count = 0;
         d->preamble_bin_hist[0] = (int)sym;
         d->preamble_bin_hist_count = 1;
+        d->preamble_peak_sum   = (double)peak;
+        d->preamble_peak_count = 1;
         d->cfo_int         = 0;
         d->cfo_frac        = 0.0f;
         d->state           = STATE_PREAMBLE_OK;
@@ -1005,6 +1251,11 @@ static void state_tick(lora_decoder_t *d)
     case STATE_PREAMBLE_OK: {
         if (!above_floor) {
             /* Lost the signal -- back to hunting. */
+            if (framesync_enabled())
+                fprintf(stderr,
+                    "[fs] frame=%d POK_TICK sym=%d peak=%.3f noise=%.3f decision=below_floor\n",
+                    d->framesync_frame_idx + 1, (int)sym,
+                    (double)peak, (double)noise);
             reset_to_idle(d);
             d->preamble_fft_count = 0;
             break;
@@ -1012,24 +1263,109 @@ static void state_tick(lora_decoder_t *d)
         int diff = abs((int)sym - d->preamble_bin);
         /* Account for FFT wrap-around. */
         if (diff > d->N / 2) diff = d->N - diff;
+        /* Detect window-straddle ticks where the dechirped FFT spans
+         * the preamble->sync chirp boundary. In that case the argmax
+         * bin can land on the preamble bin (matching) but the peak
+         * magnitude drops to ~sinc(0.5) of the preamble mean (the
+         * energy is split between bin v and bin v+sync_offset). If
+         * we treat such a tick as still-preamble we over-count by one
+         * symbol and start the header one symbol late -- the
+         * os_factor=2 SFO=0 baseline failure. After at least
+         * PREAMBLE_MIN clean matches, a peak drop below
+         * STRADDLE_PEAK_RATIO of the running mean triggers the sync
+         * transition regardless of bin. Threshold 0.7 catches the
+         * observed ~0.5 ratio on straddle ticks with plenty of margin
+         * over natural preamble-peak variations. */
+        const float STRADDLE_PEAK_RATIO = 0.7f;
+        float preamble_peak_mean = (d->preamble_peak_count > 0)
+            ? (float)(d->preamble_peak_sum / (double)d->preamble_peak_count)
+            : 0.0f;
+        bool straddle_trigger =
+            (d->preamble_count >= PREAMBLE_MIN)
+            && (preamble_peak_mean > 0.0f)
+            && (peak < STRADDLE_PEAK_RATIO * preamble_peak_mean);
+        if (framesync_enabled()) {
+            /* frame_idx here is the *prospective* index of the frame
+             * currently being assembled; it gets committed at LOCK. The
+             * "+1" reflects that the LOCK emit hasn't yet incremented
+             * the counter for this frame attempt. */
+            const char *decision;
+            if (diff <= 2 && !straddle_trigger)
+                decision = "still";
+            else if (straddle_trigger)
+                decision = "sync_start_straddle";
+            else if (d->preamble_count >= PREAMBLE_MIN)
+                decision = "sync_start";
+            else
+                decision = "shift_in_prelock";
+            fprintf(stderr,
+                "[fs] frame=%d POK_TICK sym=%d peak=%.3f bin=%d diff=%d pcount=%d "
+                "mean_peak=%.3f decision=%s\n",
+                d->framesync_frame_idx + 1, (int)sym, (double)peak,
+                d->preamble_bin, diff, d->preamble_count,
+                (double)preamble_peak_mean, decision);
+        }
         /* ±2 bin tolerance: with Hamming-window leakage and residual CFO,
          * the preamble FFT peak can oscillate between three adjacent
          * bins. A ±1 tolerance fires SHIFT spuriously on the wobble.
          * The smallest sync-word offset we still need to detect cleanly
          * is sync_word=1 -> bin = 8 (LoRa convention), so ±2 leaves
          * margin without missing real syncs. */
-        if (diff <= 2) {
+        if (diff <= 2 && !straddle_trigger) {
             /* Still on preamble. Cap count so we're ready to detect sync. */
             if (d->preamble_count < PREAMBLE_MIN + 4) d->preamble_count++;
+            /* Update the running preamble-peak mean used by the
+             * straddle detector above. Capped at the same horizon as
+             * preamble_count so a late strong tick doesn't dilute the
+             * mean and let an outright noise tick masquerade as a
+             * straddle later. */
+            d->preamble_peak_sum   += (double)peak;
+            d->preamble_peak_count += 1;
             /* First tick where we've collected PREAMBLE_MIN matching symbols
              * is a "lock". Record only once per preamble run so the lock
              * count is a per-preamble event, not a per-symbol event. */
             if (d->preamble_count >= PREAMBLE_MIN && !d->preamble_locked_once) {
                 d->preamble_locked_once = 1;
                 STATS_BUMP(preamble_locks, d->sf);
+                float snr_db = (peak > 0.0f && noise > 0.0f)
+                               ? (float)(20.0 * log10((double)peak / (double)noise))
+                               : 0.0f;
                 if (peak > 0.0f && noise > 0.0f)
-                    STATS_SNR(snr_hist_preamble,
-                              20.0 * log10((double)peak / (double)noise));
+                    STATS_SNR(snr_hist_preamble, snr_db);
+                /* TDOA: stash the stream cursor at the moment of lock
+                 * directly on the per-decoder meta so the next frame
+                 * delivered (if any) inherits a race-free per-frame
+                 * anchor. Subsequent locks on the same decoder
+                 * overwrite this only after the current preamble run
+                 * resets via reset_to_idle. */
+                d->meta.preamble_lock_sample_idx =
+                    d->stream_chunk_anchor +
+                    (uint64_t)d->samples_in_chunk *
+                    (uint64_t)d->stream_step_per_sample;
+                /* TDOA: also stash a software-lock wall-clock at the
+                 * moment of lock-detect. On a GPSDO-disciplined host
+                 * CLOCK_REALTIME is sub-microsecond; this is strictly
+                 * better than the dedup-emit timestamp the existing
+                 * station_t_ns field uses (which fires after the
+                 * whole frame demods). NOT a sample-derived TOA --
+                 * PFB / scheduling / buffering latency is still in
+                 * the picture; fusion labels this as
+                 * timestamp_class=software_lock, not "precise". */
+                {
+                    struct timespec ts;
+                    clock_gettime(CLOCK_REALTIME, &ts);
+                    d->meta.preamble_lock_t_ns =
+                        (uint64_t)ts.tv_sec * 1000000000ULL +
+                        (uint64_t)ts.tv_nsec;
+                }
+                /* Fire the preamble-lock callback. Subscribers (the
+                 * scan-then-focus pool, scanners, telemetry) get the
+                 * event before header decode starts -- the right
+                 * trigger for "wake a focused decoder for this slot". */
+                if (d->preamble_cb) {
+                    d->preamble_cb(d->sf, d->cr, d->bw_hz, snr_db,
+                                   d->preamble_user);
+                }
             }
             /* Snapshot the FFT bin value for cfo_frac estimation later. */
             int N_HIST = (int)(sizeof(d->preamble_fft_hist) / sizeof(d->preamble_fft_hist[0]));
@@ -1039,6 +1375,18 @@ static void state_tick(lora_decoder_t *d)
             int B_HIST = (int)(sizeof(d->preamble_bin_hist) / sizeof(d->preamble_bin_hist[0]));
             if (d->preamble_bin_hist_count < B_HIST)
                 d->preamble_bin_hist[d->preamble_bin_hist_count++] = (int)sym;
+            /* Snapshot the dechirped time-domain samples for RCTSL sto_frac
+             * estimation. demod_one_symbol_full left them in d->fft_in.
+             * Rolling buffer keeps the last K preamble symbols. */
+            if (d->preamble_dechirped) {
+                int K = d->preamble_dechirped_capacity;
+                int slot = d->preamble_dechirped_next;
+                memcpy(&d->preamble_dechirped[(size_t)slot * d->N],
+                       d->fft_in, sizeof(float complex) * (size_t)d->N);
+                d->preamble_dechirped_next = (slot + 1) % K;
+                if (d->preamble_dechirped_count < K)
+                    d->preamble_dechirped_count++;
+            }
         } else if (d->preamble_count >= PREAMBLE_MIN) {
             /* Bin shifted significantly after we had a confirmed preamble:
              * this is the first sync-word symbol. Treat it as such -- skip
@@ -1055,6 +1403,30 @@ static void state_tick(lora_decoder_t *d)
             d->state      = STATE_HEADER;
             STATS_BUMP(sync_seen,       d->sf);
             STATS_BUMP(header_attempts, d->sf);
+            /* RCTSL fractional STO estimate. Currently advisory-only at
+             * os_factor=1 (sub-sample shift would need os>=2); the value
+             * is stored on the decoder for downstream use. */
+            compute_sto_frac(d);
+            /* TDOA: convert the channel-rate sto_frac estimate to
+             * SDR-sample units, in TOA-positive-late convention, and
+             * stamp it on the meta the next delivered frame will
+             * inherit. Read-only metadata; the demod path does not
+             * use this field.
+             *
+             * Sign note: gr-lora_sdr's sto_frac is "shift our window
+             * LATER by sto_frac to catch a preamble that arrived
+             * sto_frac LATE relative to where we sampled." The
+             * existing fine-skip path at lora.c:downsample_symbol
+             * uses that convention directly. For the TOA-style
+             * consumer field we want
+             *     toa_sample = preamble_lock_sample_idx + frac
+             * where frac > 0 means the preamble arrived a fraction
+             * later than the integer cursor. Empirically (FFT-domain
+             * known-delay synth fixture in tests/test_subsample_toa.py)
+             * those two conventions disagree by a sign, so we negate
+             * here at publish time. d->sto_frac itself is untouched. */
+            d->meta.preamble_lock_sample_frac =
+                -d->sto_frac * (float)d->stream_step_per_sample;
             /* k_hat = mode of the captured preamble bins (gr-lora_sdr's
              * `most_frequent(preamb_up_vals, n_up_req)` form, frame_sync_impl.cc:534).
              * The IDLE-entry latch can be off by ±1 due to FFT peak landing
@@ -1136,6 +1508,31 @@ static void state_tick(lora_decoder_t *d)
              * so subsequent header/payload FFT-bin interpretation should
              * subtract 0 (not k_hat). */
             d->preamble_bin = 0;
+
+            if (framesync_enabled()) {
+                ++d->framesync_frame_idx;
+                d->framesync_k_hat    = k_hat;
+                d->framesync_sto_skip = d->sto_skip_remaining;
+                /* sto_fine is the per-symbol input-sample shift
+                 * downsample_symbol will apply from sto_frac. At os=1
+                 * always 0 (lrint of [-0.5, +0.5]*1 = 0); at os>=2
+                 * this surfaces the gr-lora-style sub-output-sample
+                 * correction alongside the integer phase pick. */
+                int fs_fine = (d->os_factor > 1)
+                    ? (int)lrintf(d->sto_frac * (float)d->os_factor)
+                    : 0;
+                fprintf(stderr,
+                    "[fs] frame=%d LOCK sf=%d os=%d k_hat=%d k_signed=%d sto_skip=%d "
+                    "sto_frac=%+0.4f sto_fine=%+d cfo_frac=%+0.4f preamble_bins=[",
+                    d->framesync_frame_idx, d->sf, d->os_factor, k_hat, k_signed,
+                    d->sto_skip_remaining,
+                    (double)d->sto_frac, fs_fine, (double)d->cfo_frac);
+                int hist_n = d->preamble_bin_hist_count;
+                for (int i = 0; i < hist_n; ++i)
+                    fprintf(stderr, "%d%s", d->preamble_bin_hist[i],
+                            i == hist_n - 1 ? "" : ",");
+                fprintf(stderr, "]\n");
+            }
             d->preamble_bin_hist_count = 0;
         } else {
             reset_to_idle(d);
@@ -1158,10 +1555,30 @@ static void state_tick(lora_decoder_t *d)
              * tick 1 = DC2 (measure cfo_int from downchirp dechirp). */
             if (d->header_idx == 1) {
                 int down_val = demod_downchirp_argmax(d, sym_samples);
-                if ((uint32_t)down_val < (uint32_t)(d->N / 2))
-                    d->cfo_int = down_val / 2;
-                else
-                    d->cfo_int = (down_val - d->N) / 2;
+                /* DC2 dechirp peak lives at round(2*(cfo_int + cfo_frac))
+                 * (with cfo_frac already estimated from preamble). The
+                 * naive floor-divide form `cfo_int = down_val / 2`
+                 * silently drops the half-bin LSB, which manifests as a
+                 * 1-bin cfo_int error any time the true CFO falls on a
+                 * half-bin boundary and cfo_frac wraps to its sign-
+                 * opposite (e.g. true cfo_bins = 11.71 -> cfo_frac is
+                 * estimated as -0.29 by the preamble four_cum, DC2 peak
+                 * lands at 23.42 which rounds to 23 or 24 from noise;
+                 * cfo_int = 11 or 12 from floor-divide gives
+                 * cfo_bins = 10.71 or 11.71 -- correct only half the
+                 * time). Disambiguate by using cfo_frac to pick the
+                 * rounding direction: cfo_int = round(down_val/2 -
+                 * cfo_frac). Both DC2 measurements (23 or 24) converge
+                 * to the same cfo_int. Manifests at SFO=25 ppm on the
+                 * Short/Medium/Long{Fast,Turbo} cells where induced
+                 * cfo_bins ~= 11.71 hits the half-bin boundary. */
+                int signed_down = (down_val < d->N / 2)
+                                  ? down_val
+                                  : down_val - d->N;
+                d->cfo_int = (int)lrint((double)signed_down / 2.0
+                                        - (double)d->cfo_frac);
+                if (framesync_enabled())
+                    d->framesync_dc2_down_val = down_val;
                 /* DEBUG: env-gated force of cfo_int. */
                 {
                     const char *e = getenv("MESHTASTIC_DEBUG_FORCE_CFO_INT");
@@ -1174,6 +1591,19 @@ static void state_tick(lora_decoder_t *d)
                 if (trace_on)
                     fprintf(stderr, "[lora] cfo_int=%d cfo_frac=%.4f (down_val=%d)\n",
                             d->cfo_int, (double)d->cfo_frac, down_val);
+                /* gr-lora_sdr-style SFO drift estimate, frame_sync_impl.cc:638.
+                 * Same-crystal assumption: sample-rate offset and carrier
+                 * offset are proportional. sfo_hat (in fractional samples
+                 * per symbol) = (cfo_bins) * bw_hz / center_freq_hz where
+                 * cfo_bins = cfo_int + cfo_frac. Drives the per-symbol
+                 * consume-count adjustment in STATE_PAYLOAD below. */
+                if (d->center_freq_hz > 0.0) {
+                    double cfo_bins = (double)d->cfo_int + (double)d->cfo_frac;
+                    d->sfo_hat = cfo_bins * (double)d->bw_hz / d->center_freq_hz;
+                } else {
+                    d->sfo_hat = 0.0;
+                }
+                d->sfo_cum = 0.0;
             }
             d->header_idx++;
             if (d->header_idx == 2) {
@@ -1181,27 +1611,32 @@ static void state_tick(lora_decoder_t *d)
                  * quarter-downchirp tail skip plus the carrier-offset
                  * time correction before reading header[0].
                  *
-                 * The earlier integer-only form `trim = N/4 + cfo_int`
-                 * dropped the cfo_frac portion of the total CFO. At
-                 * |cfo_frac| > ~0.4 (any SF -- this is a fractional-
-                 * boundary issue, not SF-specific) the truncated trim
-                 * lands the header symbol's FFT window 1 output sample
-                 * off the symbol grid, the dechirped peak shifts by 1
-                 * bin, and the 5-bit header checksum fails. Verified
-                 * 2026-05-25: forcing the alternative split
-                 * (cfo_int+1, cfo_frac-1) at SF9 +8 kHz produced an
-                 * identical down[n] chirp reference but trim that was
-                 * 1 sample larger, and decoded correctly.
-                 *
-                 * Compute at input-sample precision using the full
-                 * real-valued total CFO so the cfo_frac contribution
-                 * round-trips correctly into the skip count. */
+                 * The trim's cfo_int+cfo_frac term is a TIME-domain
+                 * correction, separate from the FREQUENCY-domain
+                 * rotation now living in demod_one_symbol_full /
+                 * compute_symbol_llrs. The preamble lock at bin k_hat
+                 * absorbs (STO + cfo_int) into the skip; the trim's
+                 * +cfo_int+cfo_frac then re-adds the cfo time shift
+                 * so the symbol window grid stays at the true symbol
+                 * boundary rather than the preamble-locked grid (those
+                 * differ by exactly cfo_int+cfo_frac samples when
+                 * STO=0). Rotation in the demod handles the residual
+                 * cfo-induced frequency offset of the dechirped peak. */
                 double trim_out = (double)d->N / 4.0
                                 + (double)d->cfo_int
                                 + (double)d->cfo_frac;
                 int trim_input = (int)lrint(trim_out * (double)d->os_factor);
                 if (trim_input < 0) trim_input = 0;
                 d->sto_skip_remaining += trim_input;
+                if (framesync_enabled()) {
+                    d->framesync_trim_input = trim_input;
+                    fprintf(stderr,
+                        "[fs] frame=%d DC2  down_val=%d cfo_int=%d cfo_frac=%+0.4f "
+                        "trim_input=%d sto_skip_after=%d\n",
+                        d->framesync_frame_idx, d->framesync_dc2_down_val,
+                        d->cfo_int, (double)d->cfo_frac,
+                        trim_input, d->sto_skip_remaining);
+                }
             }
             break;
         }
@@ -1230,9 +1665,25 @@ static void state_tick(lora_decoder_t *d)
                 uint16_t gray = (uint16_t)(demod_out ^ (demod_out >> 1));
                 d->header_syms[hi] = gray;
             }
+            if (framesync_enabled() && hi >= 0 && hi < 8) {
+                d->framesync_header_bins[hi] = (int)sym;
+                d->framesync_header_mags[hi] = peak;
+            }
             ++d->header_idx;
         }
         if (d->header_idx == 2 + 8) {
+            if (framesync_enabled()) {
+                fprintf(stderr, "[fs] frame=%d HEADER bins=[",
+                        d->framesync_frame_idx);
+                for (int i = 0; i < 8; ++i)
+                    fprintf(stderr, "%d%s", d->framesync_header_bins[i],
+                            i == 7 ? "" : ",");
+                fprintf(stderr, "] mags=[");
+                for (int i = 0; i < 8; ++i)
+                    fprintf(stderr, "%.3f%s", (double)d->framesync_header_mags[i],
+                            i == 7 ? "" : ",");
+                fprintf(stderr, "]\n");
+            }
             /* Decode header per gr-lora_sdr header_decoder_impl.cc:
              *   - sf_app = sf-2 (header always uses reduced-rate)
              *   - cr_hdr = 8 (header always 4/8)
@@ -1397,7 +1848,12 @@ static void state_tick(lora_decoder_t *d)
                 else { bytes[byte_count++] = (uint8_t)((nib << 4) | pending_lo); pending_lo = -1; }
             }
             for (int blk = 0; blk + cr_p <= d->payload_sym_count; blk += cr_p) {
-                uint8_t cw_hard[16];
+                /* Zero-init silences a GCC may-be-uninitialized warning:
+                 * cw_hard is written by lora_deinterleave() inside the
+                 * d->soft_decoding==false branch and read by
+                 * lora_hamming_decode() inside the same branch. The
+                 * conditions match but the compiler can't prove it. */
+                uint8_t cw_hard[16] = {0};
                 float   cw_soft[16][8];
                 if (d->soft_decoding) {
                     lora_deinterleave_soft(
@@ -1516,6 +1972,51 @@ static void state_tick(lora_decoder_t *d)
         break;
     }
     }
+
+    /* gr-lora_sdr-style per-symbol SFO drift adjustment, frame_sync_impl.cc:855-862.
+     *
+     * sfo_hat is fractional samples of drift per symbol, set at DC2 from the
+     * measured CFO and the slot's center frequency (same-crystal assumption).
+     * Per symbol we accumulate sfo_cum; when it crosses 1/(2*os_factor) we
+     * skip an input sample before the next FFT to maintain symbol-grid
+     * alignment. Applied to every symbol AFTER the DC2 measurement -- the
+     * header data symbols also need this, not just payload.
+     *
+     * Positive direction only for now: shifts the next FFT start one sample
+     * later via sto_skip_remaining. Negative direction (receiver clock slow,
+     * sample stream falls behind grid) is unimplemented.
+     *
+     * Conditional on state to skip preamble + DC1 + DC2 ticks. After
+     * reset_to_idle (frame delivered) the state machine returns to IDLE
+     * and sfo_hat is zeroed, so the accumulator quiesces. */
+    bool apply_drift = (d->state == STATE_HEADER && d->header_idx >= 2)
+                    || (d->state == STATE_PAYLOAD);
+    if (apply_drift && d->sfo_hat != 0.0) {
+        d->sfo_cum += d->sfo_hat;
+        /* Threshold = 1.0 instead of gr-lora's 1/(2*os) = 0.5. Empirically
+         * a 0.5 threshold fires the carry-back mechanism at moderate drift
+         * cells (LongSlow SFO=5 ppm) where the cumulative drift over a
+         * frame is only ~1 sample and the decoder already tolerates it
+         * without help. The cost of carry-back (one sample of phase-
+         * discontinuity contamination in the next FFT) outweighs the
+         * benefit at low drift. Threshold 1.0 only fires when accumulated
+         * drift would push the FFT peak ~1 full bin off the symbol grid. */
+        const double thresh = 1.0;
+        const double adj = 1.0 / (double)d->os_factor;
+        if (d->sfo_cum > thresh) {
+            d->sfo_next_sym_shift = +1;
+            d->sfo_cum -= adj;
+        } else if (d->sfo_cum < -thresh) {
+            d->sfo_next_sym_shift = -1;
+            d->sfo_cum += adj;
+        }
+        const char *dbg = getenv("MESHTASTIC_LORA_DEBUG_SFO");
+        if (dbg && *dbg == '1') {
+            fprintf(stderr, "[sfo] state=%d hdr_idx=%d sfo_hat=%.4f cum=%.4f shift=%+d\n",
+                    d->state, d->header_idx, d->sfo_hat, d->sfo_cum,
+                    d->sfo_next_sym_shift);
+        }
+    }
 }
 
 void lora_decoder_feed(lora_decoder_t *d, const float complex *samples, size_t n)
@@ -1530,12 +2031,32 @@ void lora_decoder_feed(lora_decoder_t *d, const float complex *samples, size_t n
     for (size_t i = 0; i < n; ++i) {
         if (d->sto_skip_remaining > 0) {
             --d->sto_skip_remaining;
+            ++d->samples_in_chunk;
             continue;
         }
         d->symbuf[d->symbuf_count++] = samples[i];
+        ++d->samples_in_chunk;
         if (d->symbuf_count == spsym) {
             state_tick(d);
-            d->symbuf_count = 0;
+            /* Apply SFO drift-corrected symbol boundary shift, set by
+             * state_tick during STATE_HEADER post-DC2 / STATE_PAYLOAD.
+             *
+             * +1 = next FFT 1 sample EARLIER. Achieved by reusing this
+             *      symbol's last sample as the next symbol's first.
+             * -1 = next FFT 1 sample LATER. Achieved via one extra
+             *      sto_skip_remaining (which lora_decoder_feed already
+             *      honors at the top of this loop).
+             *  0 = no shift (default). */
+            if (d->sfo_next_sym_shift > 0) {
+                d->symbuf[0] = d->symbuf[spsym - 1];
+                d->symbuf_count = 1;
+            } else if (d->sfo_next_sym_shift < 0) {
+                d->sto_skip_remaining += 1;
+                d->symbuf_count = 0;
+            } else {
+                d->symbuf_count = 0;
+            }
+            d->sfo_next_sym_shift = 0;
         }
     }
 }

@@ -1,0 +1,33 @@
+# ThreadSanitizer suppressions for meshtastic-sniffer.
+#
+# Use with: TSAN_OPTIONS=suppressions=tsan.suppressions:halt_on_error=0
+# Build with: cmake -DMESH_SAN=thread -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF ..
+# Run with:   setarch $(uname -m) -R ./meshtastic-sniffer ...
+#             (the -R drops ASLR; libtsan + modern kernels otherwise
+#              die with "unexpected memory mapping" at startup.)
+#
+# Each suppression below is a known false positive whose underlying
+# code is correct under its own synchronization contract, but the
+# contract is invisible to TSAN.
+
+# The PFB sink-pool inner loop is parallelised with OpenMP. libgomp
+# barriers around `#pragma omp parallel for` provide the happens-before
+# edge between the master thread's setup (realloc, channel index
+# arrays) and the worker threads' reads. TSAN does not see through
+# libgomp's runtime, so it reports the canonical master-prepares /
+# parallel-reads pattern as a race. None of these are real.
+race:channelizer_process_int8
+race:channelizer_process_float
+race:pfb_process
+race:pfb_run_channel
+
+# Global `running` is `volatile sig_atomic_t`. SIGINT/SIGTERM writes it
+# from on_signal, and every long-loop thread reads it. The
+# `volatile sig_atomic_t` pattern is the canonical signal-safe flag
+# (C99 and POSIX). Converting to a C11 atomic type needs a careful read
+# of signal-safety guarantees on each target platform; that work
+# deserves its own focused commit, not a drive-by in a TSAN-quieting
+# sweep. Suppress for now.
+race:on_signal
+race:file_src_thread
+race:stats_thread

@@ -171,7 +171,7 @@ static void make_simple_psk(int n, uint8_t out[16])
 static bool fill_candidate(const char *line, candidate_t *c)
 {
     memset(c, 0, sizeof(*c));
-    strncpy(c->source, line, sizeof(c->source) - 1);
+    snprintf(c->source, sizeof(c->source), "%s", line);
 
     if (!strncmp(line, "base64:", 7)) {
         int n = parse_b64(line + 7, c->psk, sizeof(c->psk));
@@ -319,6 +319,14 @@ static const char USAGE[] =
     "                          $meshtastic$1*<chash>*<packet_id>*<from_node>*<name_hex>*<ciphertext_hex>\n"
     "                      consumable by a future hashcat custom-mode plugin\n"
     "                      (work in progress; format documented in recover/README.md)\n"
+    "  --hashcat-export-merge=N\n"
+    "                      with --hashcat-export, group up to N consecutive\n"
+    "                      same-channel frames into a $meshtastic$2 multi-frame\n"
+    "                      line (N = 2..16). Cross-frame hashcat verification\n"
+    "                      then requires a candidate PSK to decrypt every frame\n"
+    "                      in the line, eliminating single-frame false positives\n"
+    "                      at scale. Tail groups of size 1 still emit as $meshtastic$1.\n"
+    "                      Default N = 1 keeps the existing one-frame-per-line output.\n"
     "  --channel-name=NAME populate the <name_hex> field on export. Use when the\n"
     "                      attacker knows the channel name (most realistic case --\n"
     "                      Meshtastic NodeInfo advertises names in cleartext).\n"
@@ -340,12 +348,20 @@ int main(int argc, char **argv)
     const char *channel_name = "";
     bool also_simple = false;
     int max_frames = 0;
+    int hashcat_merge = 1;  /* 1 = legacy v1 one-line-per-frame; 2..16 = v2 multi-frame */
 
     for (int i = 1; i < argc; ++i) {
         if      (!strncmp(argv[i], "--pcap=", 7))     pcap_path = argv[i] + 7;
         else if (!strncmp(argv[i], "--wordlist=", 11)) wordlist_path = argv[i] + 11;
         else if (!strncmp(argv[i], "--output=", 9))   out_path = argv[i] + 9;
         else if (!strncmp(argv[i], "--hashcat-export=", 17)) hashcat_path = argv[i] + 17;
+        else if (!strncmp(argv[i], "--hashcat-export-merge=", 23)) {
+            hashcat_merge = atoi(argv[i] + 23);
+            if (hashcat_merge < 1 || hashcat_merge > 16) {
+                fprintf(stderr, "recover: --hashcat-export-merge must be 1..16, got %d\n", hashcat_merge);
+                return 2;
+            }
+        }
         else if (!strncmp(argv[i], "--channel-name=", 15)) channel_name = argv[i] + 15;
         else if (!strncmp(argv[i], "--max-frames=", 13)) max_frames = atoi(argv[i] + 13);
         else if (!strcmp(argv[i], "--simple-keys"))   also_simple = true;
@@ -421,28 +437,108 @@ int main(int argc, char **argv)
     if (hashcat_path) {
         FILE *hf = fopen(hashcat_path, "w");
         if (!hf) { perror(hashcat_path); free(frames); return 1; }
-        size_t emitted = 0;
-        for (size_t i = 0; i < n_frames; ++i) {
-            if (frames[i].len < 16) continue;
-            const uint8_t *b = frames[i].bytes;
-            uint8_t chash = b[13];
-            fprintf(hf, "$meshtastic$1*%02x*", chash);
-            for (int k = 0; k < 4; ++k) fprintf(hf, "%02x", b[8 + k]);  /* packet_id LE */
-            fputc('*', hf);
-            for (int k = 0; k < 4; ++k) fprintf(hf, "%02x", b[4 + k]);  /* from LE */
-            fputc('*', hf);
-            for (const char *p = channel_name; *p; ++p) fprintf(hf, "%02x", (unsigned char)*p);
-            fputc('*', hf);
-            for (size_t k = 16; k < frames[i].len; ++k)
-                fprintf(hf, "%02x", b[k]);
-            fputc('\n', hf);
-            ++emitted;
+
+        /* Heads-up when grouping is enabled but the channel name is empty:
+         * the only group key the merger has is the one-byte channel-hash,
+         * so two real channels that happen to share that byte (1 in 256
+         * collision) would be packed into the same $meshtastic$2 line.
+         * No single PSK can decrypt across two channels, so the line would
+         * exhaust without a crack. Recommend pairing --hashcat-export-merge
+         * with --channel-name when grouping across a multi-channel capture. */
+        if (hashcat_merge >= 2 && !(channel_name && *channel_name)) {
+            fprintf(stderr,
+                "recover: warning: --hashcat-export-merge=%d with empty --channel-name\n"
+                "         groups frames by channel-hash byte only; if the capture\n"
+                "         spans multiple channels with the same chash byte, the\n"
+                "         resulting $meshtastic$2 line cannot be cracked by any\n"
+                "         single PSK. Pass --channel-name=NAME if you know it.\n",
+                hashcat_merge);
         }
+
+        /* Helper: write one frame triple (pkt_id_LE, from_node_LE, ct_hex) preceded
+         * by a separator. Used by both the v1 single-frame and v2 multi-frame paths. */
+        #define EMIT_FRAME_TRIPLE(b_, len_) do {                                       \
+            fputc('*', hf);                                                            \
+            for (int _k = 0; _k < 4; ++_k) fprintf(hf, "%02x", (b_)[8 + _k]);          \
+            fputc('*', hf);                                                            \
+            for (int _k = 0; _k < 4; ++_k) fprintf(hf, "%02x", (b_)[4 + _k]);          \
+            fputc('*', hf);                                                            \
+            for (size_t _k = 16; _k < (len_); ++_k) fprintf(hf, "%02x", (b_)[_k]);     \
+        } while (0)
+
+        size_t emitted_v1 = 0;
+        size_t emitted_v2 = 0;
+
+        /* Walk frames once, collecting runs of consecutive frames that share the
+         * same channel hash (and the same exported channel name, which is constant
+         * for the run since --channel-name is a single CLI value). hashcat_merge=1
+         * forces groups of size 1, which makes every emission a $meshtastic$1 line
+         * byte-identical to the legacy path. */
+        size_t i = 0;
+        while (i < n_frames) {
+            if (frames[i].len < 16) { ++i; continue; }
+
+            const uint8_t group_chash = frames[i].bytes[13];
+            const size_t  group_start = i;
+            size_t        group_count = 0;
+
+            while (i < n_frames
+                   && group_count < (size_t)hashcat_merge
+                   && frames[i].len >= 16
+                   && frames[i].bytes[13] == group_chash) {
+                ++i;
+                ++group_count;
+            }
+
+            if (group_count == 1) {
+                /* v1: single frame, byte-identical to the legacy emit path. */
+                const uint8_t *b = frames[group_start].bytes;
+                fprintf(hf, "$meshtastic$1*%02x", group_chash);
+                fputc('*', hf);
+                for (int k = 0; k < 4; ++k) fprintf(hf, "%02x", b[8 + k]);
+                fputc('*', hf);
+                for (int k = 0; k < 4; ++k) fprintf(hf, "%02x", b[4 + k]);
+                fputc('*', hf);
+                for (const char *p = channel_name; *p; ++p) fprintf(hf, "%02x", (unsigned char)*p);
+                fputc('*', hf);
+                for (size_t k = 16; k < frames[group_start].len; ++k) fprintf(hf, "%02x", b[k]);
+                fputc('\n', hf);
+                ++emitted_v1;
+            } else {
+                /* v2: $meshtastic$2*<chash>*<name_hex>*<N>*<pkt1>*<from1>*<ct1>*...*<pktN>*<fromN>*<ctN> */
+                fprintf(hf, "$meshtastic$2*%02x*", group_chash);
+                for (const char *p = channel_name; *p; ++p) fprintf(hf, "%02x", (unsigned char)*p);
+                fprintf(hf, "*%zu", group_count);
+                for (size_t j = 0; j < group_count; ++j) {
+                    EMIT_FRAME_TRIPLE(frames[group_start + j].bytes, frames[group_start + j].len);
+                }
+                fputc('\n', hf);
+                ++emitted_v2;
+            }
+        }
+
+        #undef EMIT_FRAME_TRIPLE
+
         fclose(hf);
-        fprintf(stderr, "recover: wrote %zu hashcat-format lines to %s%s%s\n",
-                emitted, hashcat_path,
-                channel_name && *channel_name ? " (channel_name=" : "",
-                channel_name && *channel_name ? channel_name : "");
+
+        const bool   has_name  = channel_name && *channel_name;
+        const bool   show_merge = hashcat_merge != 1;
+        char         ctx[160] = "";
+        if (has_name && show_merge)
+            snprintf(ctx, sizeof(ctx), " (channel_name=%s, merge=%d)",
+                     channel_name, hashcat_merge);
+        else if (has_name)
+            snprintf(ctx, sizeof(ctx), " (channel_name=%s)", channel_name);
+        else if (show_merge)
+            snprintf(ctx, sizeof(ctx), " (merge=%d)", hashcat_merge);
+
+        if (hashcat_merge == 1) {
+            fprintf(stderr, "recover: wrote %zu hashcat-format lines to %s%s\n",
+                    emitted_v1, hashcat_path, ctx);
+        } else {
+            fprintf(stderr, "recover: wrote %zu $meshtastic$1 + %zu $meshtastic$2 lines to %s%s\n",
+                    emitted_v1, emitted_v2, hashcat_path, ctx);
+        }
     }
 
     /* Channel names to pair with each candidate PSK. The Meshtastic

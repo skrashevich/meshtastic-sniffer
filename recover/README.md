@@ -83,6 +83,18 @@ recovered instantly from this pass.
                          (default: stdout)
 --hashcat-export=FILE    emit each frame as a hashcat-format hash line for the
                          upcoming custom-mode plugin (mode 99001 in dev range)
+--hashcat-export-merge=N with --hashcat-export, pack up to N consecutive frames
+                         sharing the same channel identity into a single
+                         $meshtastic$2 multi-frame line (N=2..16). The plugin
+                         then requires a candidate PSK to decrypt every frame
+                         in the line, eliminating single-frame false positives
+                         at scale. Default N=1 keeps one-frame-per-line v1
+                         output. Tail groups of size 1 still emit as
+                         $meshtastic$1, so no capture data is silently dropped.
+                         Pair with --channel-name= when grouping across a
+                         multi-channel capture; with an empty name the only
+                         grouping key is the one-byte channel hash, which can
+                         collide across channels.
 --channel-name=NAME      populate the <name_hex> field on hashcat export when
                          the channel name is known (matches WPA-EAPOL's
                          ESSID-in-hash pattern). Empty by default.
@@ -134,21 +146,32 @@ private OpenCL kernel inside this binary. Reasons:
   own.
 
 `meshtastic-recover --hashcat-export=FILE` produces a hash file in a
-hashcat-idiomatic format the plugin will consume. One line per frame:
+hashcat-idiomatic format the plugin consumes. Two line shapes:
 
 ```
+v1 (one frame per line, the default):
 $meshtastic$1*<chash>*<packet_id>*<from_node>*<name_hex>*<ciphertext>
+
+v2 (multi-frame, emitted by --hashcat-export-merge=N for N>=2):
+$meshtastic$2*<chash>*<name_hex>*<N>*<pkt1>*<from1>*<ct1>*…*<pktN>*<fromN>*<ctN>
 ```
 
 | Field | Length | Meaning |
 |---|---|---|
 | `$meshtastic$` | 12 | scheme tag |
-| `1` | 1 | format version (integer; bump on incompatible changes) |
-| `<chash>` | 2 hex | 1-byte channel-hash from frame[13] |
-| `<packet_id>` | 8 hex | uint32 LE from frame[8..11] |
-| `<from_node>` | 8 hex | uint32 LE from frame[4..7] |
+| `1` or `2` | 1 | format version (integer; v1 is one frame, v2 is N frames sharing a channel) |
+| `<chash>` | 2 hex | 1-byte channel-hash from frame[13]; the same for every frame in a v2 line |
 | `<name_hex>` | 0+ hex | UTF-8 channel name (when known); empty signals unknown |
-| `<ciphertext>` | variable hex | frame[16..end] (encrypted Data envelope) |
+| `<N>` (v2 only) | decimal | frame count, 2..16 |
+| `<packet_id>` / `<pktN>` | 8 hex | uint32 LE from frame[8..11] |
+| `<from_node>` / `<fromN>` | 8 hex | uint32 LE from frame[4..7] |
+| `<ciphertext>` / `<ctN>` | variable hex | frame[16..end] (encrypted Data envelope) |
+
+A v2 line totals `4 + 3*N` `*`-separated tokens. v1 lines stay accepted by the
+plugin unchanged; v2 is purely additive. The plugin verifier requires every
+frame in a v2 line to decrypt with the candidate PSK before reporting a crack,
+which drops the structural-only false-positive rate from ~1/2^33 per frame to
+~1/2^(33*N) per multi-frame line.
 
 `--channel-name=NAME` populates the name field (matches WPA-EAPOL's
 ESSID-in-hash pattern; the realistic attack model is "operator knows
@@ -180,9 +203,10 @@ list of common preset names per candidate.
 **Hash-mode number:** to be assigned by hashcat maintainers when the
 plugin PR is reviewed (their convention: 100-step increments, recently
 35000-series and 70000-series). Until then, treat as draft. The format
-itself is forward-stable; if maintainers request changes, we bump
-`$meshtastic$1` -> `$meshtastic$2` and update `--hashcat-export`
-accordingly. The pcap remains the canonical archive; the hashcat
+is additive: `$meshtastic$1` and `$meshtastic$2` are both accepted by
+the plugin, so adding the multi-frame shape did not break existing
+v1-only consumers. Any future breaking change would bump to
+`$meshtastic$3`. The pcap remains the canonical archive; the hashcat
 export is just a derived view.
 
 ## Honest limitations

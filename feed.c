@@ -207,12 +207,48 @@ static void serialize_event(jw_t *j, const mesh_event_t *ev)
     jw_field_bool(j, "fields_trusted", fields_trusted);
     if (ev->cfo_hz > 100.0f || ev->cfo_hz < -100.0f)
         jw_field_f32(j, "cfo_hz", ev->cfo_hz);
-    /* Multilateration timestamp + accuracy class. Only emit when we
-     * have a station name to attribute observations to (mlat is a
-     * multi-station correlation; an unnamed sensor can't participate). */
+    /* Software-lock TOA timestamp (CLOCK_REALTIME stamped at the
+     * moment preamble lock was detected). Strictly earlier in the
+     * pipeline than ev->ts (which is stamped after demod completes),
+     * which is exactly what a local consumer that wants the chirp's
+     * START time needs -- the dashboard's Spectrum overlay uses it
+     * to anchor packet boxes to the row their preamble landed on
+     * instead of the row decode finished. Emitted whenever populated;
+     * mlat-only consumers still get a wall-clock to work with even
+     * if --station-id is not set. */
+    if (ev->preamble_lock_t_ns) {
+        jw_field_u64(j, "preamble_lock_t_ns", ev->preamble_lock_t_ns);
+    }
+    /* Multilateration fields. Only emit when we have a station name
+     * to attribute observations to (mlat is a multi-station
+     * correlation; an unnamed sensor can't participate). */
     if (ev->station_t_ns && opt_station_id) {
         jw_field_u64(j, "station_t_ns",     ev->station_t_ns);
         jw_field_u32(j, "station_t_acc_ns", ev->station_t_acc_ns);
+        /* TDOA anchor: absolute SDR sample index at the moment of
+         * preamble lock for this frame, plus the SDR sample rate so
+         * fusion can convert sample-count deltas across stations to
+         * seconds. Only emit when populated; pre-lock or non-LoRa
+         * frames leave both at 0. */
+        if (ev->preamble_lock_sample_idx) {
+            jw_field_u64(j, "preamble_lock_sample_idx",
+                         ev->preamble_lock_sample_idx);
+            /* Sub-sample timing offset, SDR-sample units. Convenience
+             * field for consumers that want
+             *     toa_sample = preamble_lock_sample_idx
+             *                  + preamble_lock_sample_frac
+             * The eventual cross-station IQ correlation produces the
+             * authoritative sub-sample TOA; this field is the initial
+             * fractional lock estimate from the decoder's RCTSL
+             * estimator. */
+            if (ev->preamble_lock_sample_frac != 0.0f) {
+                jw_field_f32(j, "preamble_lock_sample_frac",
+                             ev->preamble_lock_sample_frac);
+            }
+        }
+        if (ev->sample_rate_sps) {
+            jw_field_u64(j, "sample_rate_sps", ev->sample_rate_sps);
+        }
     }
 
     /* Radio-layer fields: which physical preset/SF/CR/BW the frame arrived on.
@@ -221,6 +257,7 @@ static void serialize_event(jw_t *j, const mesh_event_t *ev)
         jw_field_u32(j, "sf",    (uint32_t)ev->sf);
         jw_field_u32(j, "cr",    (uint32_t)ev->cr);
         jw_field_u32(j, "bw_hz", (uint32_t)ev->bw_hz);
+        if (ev->freq_hz) jw_field_u64(j, "freq_hz", ev->freq_hz);
         if (ev->preset_name[0]) jw_field_str(j, "preset", ev->preset_name);
     }
 
@@ -241,13 +278,29 @@ static void serialize_event(jw_t *j, const mesh_event_t *ev)
         case MESH_PORT_POSITION: {
             mesh_position_t p;
             if (mesh_decode_position(ev->payload, ev->payload_len, &p)) {
-                if (p.have_lat) jw_field_f64(j, "lat", p.lat_deg);
-                if (p.have_lon) jw_field_f64(j, "lon", p.lon_deg);
-                if (p.have_alt) jw_field_i32(j, "alt_m", p.altitude_m);
-                if (p.time_unix)   jw_field_u32(j, "time", p.time_unix);
-                if (p.sats_in_view) jw_field_u32(j, "sats", p.sats_in_view);
-                if (p.ground_speed_mps) jw_field_u32(j, "speed_mps", p.ground_speed_mps);
-                if (p.ground_track) jw_field_u32(j, "track_deg", p.ground_track);
+                if (p.have_lat)             jw_field_f64(j, "lat", p.lat_deg);
+                if (p.have_lon)             jw_field_f64(j, "lon", p.lon_deg);
+                if (p.have_alt)             jw_field_i32(j, "alt_m", p.altitude_m);
+                if (p.have_alt_hae)         jw_field_i32(j, "alt_hae_m", p.altitude_hae_m);
+                if (p.have_alt_geosep)      jw_field_i32(j, "alt_geoidal_sep_m", p.altitude_geoidal_separation_m);
+                if (p.have_time)            jw_field_u32(j, "time", p.time);
+                if (p.have_timestamp)       jw_field_u32(j, "timestamp", p.timestamp);
+                if (p.timestamp_millis_adjust) jw_field_i32(j, "timestamp_ms_adj", p.timestamp_millis_adjust);
+                if (p.location_source)      jw_field_u32(j, "loc_src", p.location_source);
+                if (p.altitude_source)      jw_field_u32(j, "alt_src", p.altitude_source);
+                if (p.pdop_x100)            jw_field_f64(j, "pdop", (double)p.pdop_x100 / 100.0);
+                if (p.hdop_x100)            jw_field_f64(j, "hdop", (double)p.hdop_x100 / 100.0);
+                if (p.vdop_x100)            jw_field_f64(j, "vdop", (double)p.vdop_x100 / 100.0);
+                if (p.gps_accuracy_mm)      jw_field_u32(j, "gps_accuracy_mm", p.gps_accuracy_mm);
+                if (p.have_ground_speed)    jw_field_u32(j, "speed_mps", p.ground_speed_mps);
+                if (p.have_ground_track)    jw_field_f64(j, "track_deg", (double)p.ground_track_x100 / 100.0);
+                if (p.fix_quality)          jw_field_u32(j, "fix_quality", p.fix_quality);
+                if (p.fix_type)             jw_field_u32(j, "fix_type", p.fix_type);
+                if (p.sats_in_view)         jw_field_u32(j, "sats", p.sats_in_view);
+                if (p.sensor_id)            jw_field_u32(j, "sensor_id", p.sensor_id);
+                if (p.next_update_s)        jw_field_u32(j, "next_update_s", p.next_update_s);
+                if (p.seq_number)           jw_field_u32(j, "seq", p.seq_number);
+                if (p.precision_bits)       jw_field_u32(j, "precision_bits", p.precision_bits);
                 /* CoT republish for any positioned node, named via node_db cache. */
                 cot_publish_position(ev, &p);
                 /* Geofence transitions: ENTRY / EXIT events when this
@@ -266,6 +319,20 @@ static void serialize_event(jw_t *j, const mesh_event_t *ev)
                 if (u.hw_model)      jw_field_u32(j, "hw_model",   u.hw_model);
                 if (u.role)          jw_field_u32(j, "role",       u.role);
                 if (u.is_licensed)   jw_field_bool(j, "licensed",  true);
+                if (u.have_is_unmessagable)
+                    jw_field_bool(j, "unmessagable", u.is_unmessagable);
+                if (u.have_public_key) {
+                    /* 32 raw bytes -> 64 hex chars + NUL. Field is public
+                     * per the proto name; PKI-DM peers need it. */
+                    char hex[2 * sizeof(u.public_key) + 1];
+                    static const char H[] = "0123456789abcdef";
+                    for (size_t k = 0; k < sizeof(u.public_key); ++k) {
+                        hex[2*k    ] = H[(u.public_key[k] >> 4) & 0xF];
+                        hex[2*k + 1] = H[ u.public_key[k]       & 0xF];
+                    }
+                    hex[2 * sizeof(u.public_key)] = '\0';
+                    jw_field_str(j, "public_key", hex);
+                }
                 node_db_remember(ev->header.from, u.long_name, u.short_name,
                                  u.hw_model, u.role);
             }
@@ -289,10 +356,28 @@ static void serialize_event(jw_t *j, const mesh_event_t *ev)
                 if (t.have_environment) {
                     jw_open_array(j, "environment");
                     jw_array_sep(j); jw_putc(j, '{'); j->first_field = true;
-                    if (t.temperature_c)              jw_field_f32(j, "temp_c",    t.temperature_c);
-                    if (t.relative_humidity)          jw_field_f32(j, "humidity",  t.relative_humidity);
-                    if (t.barometric_pressure_hpa)    jw_field_f32(j, "pressure",  t.barometric_pressure_hpa);
-                    if (t.wind_speed)                 jw_field_f32(j, "wind_mps",  t.wind_speed);
+                    if (t.temperature_c)              jw_field_f32(j, "temp_c",        t.temperature_c);
+                    if (t.relative_humidity)          jw_field_f32(j, "humidity",      t.relative_humidity);
+                    if (t.barometric_pressure_hpa)    jw_field_f32(j, "pressure",      t.barometric_pressure_hpa);
+                    if (t.gas_resistance)             jw_field_f32(j, "gas_res",       t.gas_resistance);
+                    if (t.voltage_env)                jw_field_f32(j, "voltage",       t.voltage_env);
+                    if (t.current)                    jw_field_f32(j, "current",       t.current);
+                    if (t.iaq)                        jw_field_u32(j, "iaq",           t.iaq);
+                    if (t.distance_mm)                jw_field_f32(j, "distance_mm",   t.distance_mm);
+                    if (t.lux)                        jw_field_f32(j, "lux",           t.lux);
+                    if (t.white_lux)                  jw_field_f32(j, "white_lux",     t.white_lux);
+                    if (t.ir_lux)                     jw_field_f32(j, "ir_lux",        t.ir_lux);
+                    if (t.uv_lux)                     jw_field_f32(j, "uv_lux",        t.uv_lux);
+                    if (t.wind_direction)             jw_field_u32(j, "wind_dir_deg",  t.wind_direction);
+                    if (t.wind_speed)                 jw_field_f32(j, "wind_mps",      t.wind_speed);
+                    if (t.weight)                     jw_field_f32(j, "weight",        t.weight);
+                    if (t.wind_gust)                  jw_field_f32(j, "wind_gust_mps", t.wind_gust);
+                    if (t.wind_lull)                  jw_field_f32(j, "wind_lull_mps", t.wind_lull);
+                    if (t.radiation_uSvh)             jw_field_f32(j, "radiation_uSvh", t.radiation_uSvh);
+                    if (t.rainfall_1h_mm)             jw_field_f32(j, "rain_1h_mm",    t.rainfall_1h_mm);
+                    if (t.rainfall_24h_mm)            jw_field_f32(j, "rain_24h_mm",   t.rainfall_24h_mm);
+                    if (t.soil_moisture)              jw_field_u32(j, "soil_moisture", t.soil_moisture);
+                    if (t.soil_temperature_c)         jw_field_f32(j, "soil_temp_c",   t.soil_temperature_c);
                     jw_putc(j, '}');
                     jw_close_array(j);
                 }
@@ -301,6 +386,109 @@ static void serialize_event(jw_t *j, const mesh_event_t *ev)
                     jw_array_sep(j); jw_putc(j, '{'); j->first_field = true;
                     if (t.ch1_voltage) jw_field_f32(j, "ch1_v", t.ch1_voltage);
                     if (t.ch1_current) jw_field_f32(j, "ch1_a", t.ch1_current);
+                    if (t.ch2_voltage) jw_field_f32(j, "ch2_v", t.ch2_voltage);
+                    if (t.ch2_current) jw_field_f32(j, "ch2_a", t.ch2_current);
+                    if (t.ch3_voltage) jw_field_f32(j, "ch3_v", t.ch3_voltage);
+                    if (t.ch3_current) jw_field_f32(j, "ch3_a", t.ch3_current);
+                    if (t.ch4_voltage) jw_field_f32(j, "ch4_v", t.ch4_voltage);
+                    if (t.ch4_current) jw_field_f32(j, "ch4_a", t.ch4_current);
+                    if (t.ch5_voltage) jw_field_f32(j, "ch5_v", t.ch5_voltage);
+                    if (t.ch5_current) jw_field_f32(j, "ch5_a", t.ch5_current);
+                    if (t.ch6_voltage) jw_field_f32(j, "ch6_v", t.ch6_voltage);
+                    if (t.ch6_current) jw_field_f32(j, "ch6_a", t.ch6_current);
+                    if (t.ch7_voltage) jw_field_f32(j, "ch7_v", t.ch7_voltage);
+                    if (t.ch7_current) jw_field_f32(j, "ch7_a", t.ch7_current);
+                    if (t.ch8_voltage) jw_field_f32(j, "ch8_v", t.ch8_voltage);
+                    if (t.ch8_current) jw_field_f32(j, "ch8_a", t.ch8_current);
+                    jw_putc(j, '}');
+                    jw_close_array(j);
+                }
+                if (t.have_air_quality) {
+                    jw_open_array(j, "air_quality");
+                    jw_array_sep(j); jw_putc(j, '{'); j->first_field = true;
+                    if (t.aq_pm10_standard)    jw_field_u32(j, "pm10_std",   t.aq_pm10_standard);
+                    if (t.aq_pm25_standard)    jw_field_u32(j, "pm25_std",   t.aq_pm25_standard);
+                    if (t.aq_pm100_standard)   jw_field_u32(j, "pm100_std",  t.aq_pm100_standard);
+                    if (t.aq_pm10_env)         jw_field_u32(j, "pm10_env",   t.aq_pm10_env);
+                    if (t.aq_pm25_env)         jw_field_u32(j, "pm25_env",   t.aq_pm25_env);
+                    if (t.aq_pm100_env)        jw_field_u32(j, "pm100_env",  t.aq_pm100_env);
+                    if (t.aq_particles_03um)   jw_field_u32(j, "p_03um",     t.aq_particles_03um);
+                    if (t.aq_particles_05um)   jw_field_u32(j, "p_05um",     t.aq_particles_05um);
+                    if (t.aq_particles_10um)   jw_field_u32(j, "p_10um",     t.aq_particles_10um);
+                    if (t.aq_particles_25um)   jw_field_u32(j, "p_25um",     t.aq_particles_25um);
+                    if (t.aq_particles_50um)   jw_field_u32(j, "p_50um",     t.aq_particles_50um);
+                    if (t.aq_particles_100um)  jw_field_u32(j, "p_100um",    t.aq_particles_100um);
+                    if (t.aq_co2)              jw_field_u32(j, "co2_ppm",    t.aq_co2);
+                    if (t.aq_co2_temperature_c)jw_field_f32(j, "co2_temp_c", t.aq_co2_temperature_c);
+                    if (t.aq_co2_humidity)     jw_field_f32(j, "co2_hum",    t.aq_co2_humidity);
+                    if (t.aq_formaldehyde_ppb) jw_field_f32(j, "ch2o_ppb",   t.aq_formaldehyde_ppb);
+                    if (t.aq_form_humidity)    jw_field_f32(j, "ch2o_hum",   t.aq_form_humidity);
+                    if (t.aq_form_temperature_c) jw_field_f32(j, "ch2o_temp_c", t.aq_form_temperature_c);
+                    if (t.aq_pm40_standard)    jw_field_u32(j, "pm40_std",   t.aq_pm40_standard);
+                    if (t.aq_particles_40um)   jw_field_u32(j, "p_40um",     t.aq_particles_40um);
+                    if (t.aq_pm_temperature_c) jw_field_f32(j, "pm_temp_c",  t.aq_pm_temperature_c);
+                    if (t.aq_pm_humidity)      jw_field_f32(j, "pm_hum",     t.aq_pm_humidity);
+                    if (t.aq_pm_voc_idx)       jw_field_f32(j, "pm_voc",     t.aq_pm_voc_idx);
+                    if (t.aq_pm_nox_idx)       jw_field_f32(j, "pm_nox",     t.aq_pm_nox_idx);
+                    if (t.aq_particles_tps)    jw_field_f32(j, "p_tps_um",   t.aq_particles_tps);
+                    jw_putc(j, '}');
+                    jw_close_array(j);
+                }
+                if (t.have_local_stats) {
+                    jw_open_array(j, "local_stats");
+                    jw_array_sep(j); jw_putc(j, '{'); j->first_field = true;
+                    if (t.local_uptime_s)              jw_field_u32(j, "uptime_s",        t.local_uptime_s);
+                    if (t.local_channel_utilization)   jw_field_f32(j, "ch_util",         t.local_channel_utilization);
+                    if (t.local_air_util_tx)           jw_field_f32(j, "air_tx",          t.local_air_util_tx);
+                    if (t.local_num_packets_tx)        jw_field_u32(j, "pkts_tx",         t.local_num_packets_tx);
+                    if (t.local_num_packets_rx)        jw_field_u32(j, "pkts_rx",         t.local_num_packets_rx);
+                    if (t.local_num_packets_rx_bad)    jw_field_u32(j, "pkts_rx_bad",     t.local_num_packets_rx_bad);
+                    if (t.local_num_online_nodes)      jw_field_u32(j, "nodes_online",    t.local_num_online_nodes);
+                    if (t.local_num_total_nodes)       jw_field_u32(j, "nodes_total",     t.local_num_total_nodes);
+                    if (t.local_num_rx_dupe)           jw_field_u32(j, "rx_dupe",         t.local_num_rx_dupe);
+                    if (t.local_num_tx_relay)          jw_field_u32(j, "tx_relay",        t.local_num_tx_relay);
+                    if (t.local_num_tx_relay_canceled) jw_field_u32(j, "tx_relay_cancel", t.local_num_tx_relay_canceled);
+                    if (t.local_heap_total_bytes)      jw_field_u32(j, "heap_total",      t.local_heap_total_bytes);
+                    if (t.local_heap_free_bytes)       jw_field_u32(j, "heap_free",       t.local_heap_free_bytes);
+                    if (t.local_num_tx_dropped)        jw_field_u32(j, "tx_dropped",      t.local_num_tx_dropped);
+                    if (t.local_noise_floor_dbm)       jw_field_i32(j, "noise_floor_dbm", t.local_noise_floor_dbm);
+                    jw_putc(j, '}');
+                    jw_close_array(j);
+                }
+                if (t.have_health) {
+                    jw_open_array(j, "health");
+                    jw_array_sep(j); jw_putc(j, '{'); j->first_field = true;
+                    if (t.health_heart_bpm)      jw_field_u32(j, "heart_bpm",   t.health_heart_bpm);
+                    if (t.health_spo2)           jw_field_u32(j, "spo2",        t.health_spo2);
+                    if (t.health_temperature_c)  jw_field_f32(j, "body_temp_c", t.health_temperature_c);
+                    jw_putc(j, '}');
+                    jw_close_array(j);
+                }
+                if (t.have_host) {
+                    jw_open_array(j, "host");
+                    jw_array_sep(j); jw_putc(j, '{'); j->first_field = true;
+                    if (t.host_uptime_s)         jw_field_u32(j, "uptime_s",      t.host_uptime_s);
+                    if (t.host_freemem_bytes)    jw_field_u64(j, "freemem_bytes", t.host_freemem_bytes);
+                    if (t.host_diskfree1_bytes)  jw_field_u64(j, "disk1_bytes",   t.host_diskfree1_bytes);
+                    if (t.host_diskfree2_bytes)  jw_field_u64(j, "disk2_bytes",   t.host_diskfree2_bytes);
+                    if (t.host_diskfree3_bytes)  jw_field_u64(j, "disk3_bytes",   t.host_diskfree3_bytes);
+                    if (t.host_load1_x100)       jw_field_u32(j, "load1_x100",    t.host_load1_x100);
+                    if (t.host_load5_x100)       jw_field_u32(j, "load5_x100",    t.host_load5_x100);
+                    if (t.host_load15_x100)      jw_field_u32(j, "load15_x100",   t.host_load15_x100);
+                    if (t.host_user_string[0])   jw_field_str(j, "user_string",   t.host_user_string);
+                    jw_putc(j, '}');
+                    jw_close_array(j);
+                }
+                if (t.have_traffic_mgmt) {
+                    jw_open_array(j, "traffic_mgmt");
+                    jw_array_sep(j); jw_putc(j, '{'); j->first_field = true;
+                    if (t.tm_packets_inspected)     jw_field_u32(j, "inspected",        t.tm_packets_inspected);
+                    if (t.tm_position_dedup_drops)  jw_field_u32(j, "pos_dedup_drops",  t.tm_position_dedup_drops);
+                    if (t.tm_nodeinfo_cache_hits)   jw_field_u32(j, "nodeinfo_hits",    t.tm_nodeinfo_cache_hits);
+                    if (t.tm_rate_limit_drops)      jw_field_u32(j, "rate_limit_drops", t.tm_rate_limit_drops);
+                    if (t.tm_unknown_packet_drops)  jw_field_u32(j, "unknown_drops",    t.tm_unknown_packet_drops);
+                    if (t.tm_hop_exhausted_packets) jw_field_u32(j, "hop_exhausted",    t.tm_hop_exhausted_packets);
+                    if (t.tm_router_hops_preserved) jw_field_u32(j, "router_hops_kept", t.tm_router_hops_preserved);
                     jw_putc(j, '}');
                     jw_close_array(j);
                 }
@@ -323,10 +511,23 @@ static void serialize_event(jw_t *j, const mesh_event_t *ev)
                     if (a.speed_mps)  jw_field_u32(j, "speed_mps", a.speed_mps);
                     if (a.course_deg) jw_field_u32(j, "course_deg", a.course_deg);
                 } else if (a.kind == MESH_ATAK_CHAT) {
+                    const char *receipt = NULL;
+                    switch (a.chat_receipt_type) {
+                    case 1: receipt = "delivered"; break;
+                    case 2: receipt = "read";      break;
+                    default: break;
+                    }
+                    if (receipt) jw_field_str(j, "atak_chat_receipt", receipt);
                     if (a.chat_message[0]) jw_field_str(j, "atak_chat", a.chat_message);
                     if (a.chat_to[0])      jw_field_str(j, "atak_chat_to", a.chat_to);
                     if (a.chat_to_callsign[0])
                         jw_field_str(j, "atak_chat_to_callsign", a.chat_to_callsign);
+                    if (a.chat_receipt_for_uid[0])
+                        jw_field_str(j, "atak_chat_receipt_for", a.chat_receipt_for_uid);
+                    if (a.chat_lang[0])    jw_field_str(j, "atak_chat_lang", a.chat_lang);
+                    if (a.chat_room_id[0]) jw_field_str(j, "atak_chat_room", a.chat_room_id);
+                    if (a.chat_has_voice_profile)
+                        jw_field_str(j, "atak_chat_taktalk", "1");
                 }
                 /* CoT multicast republish on PLI / DETAIL. */
                 cot_publish_atak(ev, &a);
@@ -419,9 +620,9 @@ static void serialize_event(jw_t *j, const mesh_event_t *ev)
         case MESH_PORT_KEY_VERIFICATION: {
             mesh_keyverif_t kv;
             if (mesh_decode_keyverif(ev->payload, ev->payload_len, &kv)) {
-                if (kv.remote_node_id) jw_field_u32(j, "kv_remote", kv.remote_node_id);
-                if (kv.hash1_len)      jw_field_u32(j, "kv_hash1_len", (uint32_t)kv.hash1_len);
-                if (kv.hash2_len)      jw_field_u32(j, "kv_hash2_len", (uint32_t)kv.hash2_len);
+                if (kv.nonce)     jw_field_u64(j, "kv_nonce", kv.nonce);
+                if (kv.hash1_len) jw_field_u32(j, "kv_hash1_len", (uint32_t)kv.hash1_len);
+                if (kv.hash2_len) jw_field_u32(j, "kv_hash2_len", (uint32_t)kv.hash2_len);
             }
             break;
         }
@@ -458,9 +659,8 @@ static void serialize_event(jw_t *j, const mesh_event_t *ev)
             mesh_remote_hw_t h;
             if (mesh_decode_remote_hw(ev->payload, ev->payload_len, &h)) {
                 if (h.type) jw_field_u32(j, "hw_type", h.type);
-                if (h.gpio_mask)  jw_field_u32(j, "hw_gpio_mask",  (uint32_t)h.gpio_mask);
-                if (h.gpio_value) jw_field_u32(j, "hw_gpio_value", (uint32_t)h.gpio_value);
-                if (h.txid)       jw_field_u32(j, "hw_txid", h.txid);
+                if (h.gpio_mask)  jw_field_u64(j, "hw_gpio_mask",  h.gpio_mask);
+                if (h.gpio_value) jw_field_u64(j, "hw_gpio_value", h.gpio_value);
             }
             break;
         }
@@ -575,6 +775,16 @@ void feed_shutdown(void)
 void feed_publish_event(const mesh_event_t *ev)
 {
     if (!ev) return;
+    /* --trusted-only suppresses untrusted events from every publishing sink.
+     * Stats counters (in main.c) tally upstream of this so the heartbeat
+     * still shows the true LoRa frames / no-CRC count -- operators can see
+     * how much RF noise-admit is being filtered out. The decoder path is
+     * unchanged; only publication is gated. */
+    if (opt_trusted_only) {
+        bool trusted = (ev->has_crc && ev->payload_crc_ok)
+                    || (!ev->has_crc && ev->decrypted);
+        if (!trusted) return;
+    }
     char buf[2048];
     jw_t j;
     jw_init(&j, buf, sizeof(buf));

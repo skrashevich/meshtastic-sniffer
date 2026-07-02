@@ -15,11 +15,22 @@ if(APPLE)
 endif()
 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fno-common -Wall -Wextra -Wno-unused-parameter -std=c99 -Werror=implicit-function-declaration")
-set(CMAKE_C_FLAGS_DEBUG "-ggdb3 -g3 -O0 -fsanitize=address")
+if(NOT DEFINED MESH_SAN)
+    set(MESH_SAN "address")
+endif()
+# Debug build picks a sanitizer via -DMESH_SAN={address,thread,undefined}.
+# Default 'address' matches the historical behavior. Use 'thread' for TSAN
+# (and disable LTO with -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF; TSAN
+# also needs ASLR off at runtime: 'setarch -R').
+if(MESH_SAN STREQUAL "thread")
+    set(CMAKE_C_FLAGS_DEBUG "-ggdb3 -g3 -O1 -fsanitize=thread -fno-omit-frame-pointer")
+else()
+    set(CMAKE_C_FLAGS_DEBUG "-ggdb3 -g3 -O0 -fsanitize=${MESH_SAN}")
+endif()
 set(CMAKE_C_FLAGS_MINSIZEREL "-Os")
 set(CMAKE_C_FLAGS_RELWITHDEBINFO "-O3 -march=native -ggdb3 -g3")
 set(CMAKE_C_FLAGS_RELEASE "-O3 -march=native")
-set(CMAKE_EXE_LINKER_FLAGS_DEBUG "-fsanitize=address")
+set(CMAKE_EXE_LINKER_FLAGS_DEBUG "-fsanitize=${MESH_SAN}")
 
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE "RelWithDebInfo" CACHE STRING
@@ -107,6 +118,11 @@ set(SOURCES
     ${PROJECT_SOURCE_DIR}/file_src.c
     ${PROJECT_SOURCE_DIR}/vita49.c
     ${PROJECT_SOURCE_DIR}/channelizer.c
+    ${PROJECT_SOURCE_DIR}/iq_ring.c
+    ${PROJECT_SOURCE_DIR}/iq_snapshot.c
+    ${PROJECT_SOURCE_DIR}/fftw_wisdom.c
+    ${PROJECT_SOURCE_DIR}/webhook.c
+    ${PROJECT_SOURCE_DIR}/focused.c
     ${PROJECT_SOURCE_DIR}/pfb.c
     ${PROJECT_SOURCE_DIR}/lora.c
     ${PROJECT_SOURCE_DIR}/keyset.c
@@ -238,6 +254,13 @@ else()
     message(STATUS "ZMQ: not found (zmq_pub.c stubs out; --zmq will be a no-op)")
 endif()
 
+# Webhook sink (--webhook-url=...). Uses libcurl for HTTP/HTTPS POST.
+# libcurl is standard on every distro we target and the existing
+# package landscape (apt install libcurl4-gnutls-dev or -openssl-dev).
+find_package(CURL REQUIRED)
+target_link_libraries(meshtastic-sniffer PRIVATE CURL::libcurl)
+message(STATUS "CURL: enabled for webhooks (${CURL_VERSION_STRING})")
+
 set_property(TARGET meshtastic-sniffer PROPERTY C_STANDARD 99)
 set_property(TARGET meshtastic-sniffer PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
 
@@ -293,6 +316,66 @@ if(OpenMP_C_FOUND)
     target_link_libraries(test_pfb_bin_power PRIVATE OpenMP::OpenMP_C)
 endif()
 set_property(TARGET test_pfb_bin_power PROPERTY C_STANDARD 99)
+
+# test_iq_ring: unit test for the raw-IQ ring buffer used by Phase 3
+# scan-then-focus. Covers linear append, wrap, age-out and the float
+# format round-trip; pure CPU, no FFTW.
+add_executable(test_iq_ring
+    ${PROJECT_SOURCE_DIR}/tests/test_iq_ring.c
+    ${PROJECT_SOURCE_DIR}/iq_ring.c)
+target_link_libraries(test_iq_ring PRIVATE Threads::Threads)
+set_property(TARGET test_iq_ring PROPERTY C_STANDARD 99)
+
+# test_position_decode: regression test for the meshtastic.Position
+# protobuf decoder. Hand-encoded fixture exercises sfixed32 lat/lon,
+# fixed32 time, sint32 altitude_hae, and the uint32 fields whose field
+# numbers were previously shifted (HDOP vs sats_in_view, etc).
+add_executable(test_position_decode
+    ${PROJECT_SOURCE_DIR}/tests/test_position_decode.c
+    ${PROJECT_SOURCE_DIR}/mesh_decoders.c
+    ${PROJECT_SOURCE_DIR}/protobuf.c)
+target_link_libraries(test_position_decode PRIVATE m)
+set_property(TARGET test_position_decode PROPERTY C_STANDARD 99)
+
+# test_mesh_decoders: regression tests for the recent upstream-alignment
+# decoder sweep -- NeighborInfo last_rx_time fixed32, ATAK MemberRole
+# table, StoreAndForward rr labels, Telemetry LocalStats dispatch,
+# PowerMetrics ch8, ATAK GeoChat receipt fields.
+add_executable(test_mesh_decoders
+    ${PROJECT_SOURCE_DIR}/tests/test_mesh_decoders.c
+    ${PROJECT_SOURCE_DIR}/mesh_decoders.c
+    ${PROJECT_SOURCE_DIR}/protobuf.c)
+target_link_libraries(test_mesh_decoders PRIVATE m)
+set_property(TARGET test_mesh_decoders PROPERTY C_STANDARD 99)
+
+# test_mesh_packet_decode: wire-format tests for mesh_packet_decode --
+# header parsing, AES-128/256 round-trip + a golden fixed-ciphertext
+# vector, Data envelope extras (want_response/request_id/reply_id),
+# flags packing, wrong-PSK + unknown-hash error paths, mesh_packet_
+# decode_with_radio preset_name resolution, and unknown/malformed
+# Data envelopes after successful decrypt.
+add_executable(test_mesh_packet_decode
+    ${PROJECT_SOURCE_DIR}/tests/test_mesh_packet_decode.c
+    ${PROJECT_SOURCE_DIR}/mesh_packet.c
+    ${PROJECT_SOURCE_DIR}/keyset.c
+    ${PROJECT_SOURCE_DIR}/meshtastic.c
+    ${PROJECT_SOURCE_DIR}/protobuf.c
+    ${PROJECT_SOURCE_DIR}/recover/stubs.c)
+target_link_libraries(test_mesh_packet_decode PRIVATE OpenSSL::Crypto Threads::Threads m)
+set_property(TARGET test_mesh_packet_decode PROPERTY C_STANDARD 99)
+
+# focused_demo: scan-then-focus Phase 2 prototype. One shared file reader
+# streams cs8 IQ into N independent focused-decode workers, each with its
+# own DDC chain (mixer + LPF + decim) and lora_decoder_t. Bypasses the
+# wideband PFB entirely. Architectural primitive for live "stare mode".
+add_executable(focused_demo
+    ${PROJECT_SOURCE_DIR}/tests/focused_demo.c
+    ${PROJECT_SOURCE_DIR}/lora.c)
+target_link_libraries(focused_demo PRIVATE
+    Threads::Threads
+    ${FFTW3F_LIB}
+    m)
+set_property(TARGET focused_demo PROPERTY C_STANDARD 99)
 
 # CPack
 set(CPACK_PACKAGE_NAME "meshtastic-sniffer")

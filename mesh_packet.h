@@ -44,6 +44,7 @@ typedef struct mesh_event {
     int            sf;
     int            cr;             /* 5..8 = 4/5..4/8 */
     int            bw_hz;
+    uint64_t       freq_hz;        /* RF center freq of the slot the frame arrived on; 0 = unknown */
     char           preset_name[24]; /* "LongFast" / "LongSlow" / ... or "" */
 
     /* Decoder slot index (0..CHANNELIZER_MAX_CHANNELS-1) -- which of the
@@ -75,13 +76,36 @@ typedef struct mesh_event {
     uint64_t       station_t_ns;
     uint32_t       station_t_acc_ns;
 
+    /* TDOA metadata: SDR-rate absolute sample index at the moment of
+     * preamble lock for this frame, plus the sample rate so fusion can
+     * convert sample deltas into seconds. preamble_lock_sample_idx is
+     * monotonically increasing per station; cross-station alignment
+     * requires GPSDO/PPS clocks (see station_t_acc_ns). Both 0 when
+     * the source isn't a tuned LoRa decoder. */
+    uint64_t       preamble_lock_sample_idx;
+    uint64_t       sample_rate_sps;
+    /* Fractional-sample timing offset of the preamble peak, in
+     * SDR-sample units. Combines with preamble_lock_sample_idx:
+     *     toa_sample = preamble_lock_sample_idx + preamble_lock_sample_frac
+     * Read-only metadata; the decoder does not feed this back into
+     * STO/CFO/SFO. 0 when no fractional estimate was available. */
+    float          preamble_lock_sample_frac;
+    /* CLOCK_REALTIME at the moment preamble lock was detected.
+     * Strictly earlier than station_t_ns (which the dedup ring
+     * stamps when the first replica is buffered, after the frame
+     * has fully demodulated). Fusion uses this as a software-lock
+     * timing source when present; it is not a sample-derived
+     * GPSDO-grade TOA -- PFB / scheduling / buffering latency are
+     * still baked in. 0 when not populated. */
+    uint64_t       preamble_lock_t_ns;
+
     /* Inner Data envelope (when decrypted == true) */
     uint32_t       portnum;
     const uint8_t *payload;
     size_t         payload_len;
     uint32_t       request_id;         /* protobuf field 6 (or 0) */
     uint32_t       reply_id;           /* protobuf field 7 (or 0) */
-    bool           want_response;      /* protobuf field 4 */
+    bool           want_response;      /* protobuf field 3 */
 
     /* Optional: extracted typed fields per port. */
     /* TEXT_MESSAGE_APP: payload is UTF-8 text directly. */

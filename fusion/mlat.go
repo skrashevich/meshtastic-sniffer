@@ -49,21 +49,82 @@ type mlatStation struct {
 	w       float64 // weight = 1/sigma (where sigma = TAccNs)
 }
 
+// TimestampClass labels which sensor-side timestamp source the
+// solver consumed for a given observation. Order is precision-best to
+// precision-worst.
+type TimestampClass uint8
+
+const (
+	TimestampSample       TimestampClass = iota // sample-derived TOA (best; tdoa-sample-epoch branch)
+	TimestampSync                               // software_lock + converged clock-sync correction
+	TimestampSoftwareLock                       // CLOCK_REALTIME at preamble-detect, no network correction
+	TimestampFrame                              // CLOCK_REALTIME at frame-emit / dedup (worst)
+)
+
+func (c TimestampClass) String() string {
+	switch c {
+	case TimestampSample:
+		return "sample"
+	case TimestampSync:
+		return "sync"
+	case TimestampSoftwareLock:
+		return "software_lock"
+	case TimestampFrame:
+		return "frame"
+	}
+	return "unknown"
+}
+
 // MlatObservation is one station's report of hearing a particular frame.
 type MlatObservation struct {
 	StationName  string
 	Lat, Lon     float64 // station position
 	AltM         float64
-	TNs          uint64  // station_t_ns (nanoseconds since epoch)
-	TAccNs       uint32  // station_t_acc_ns (clock-discipline class)
+	TNs          uint64 // station_t_ns: frame-emit timestamp (worst tier)
+	LockTNs      uint64 // preamble_lock_t_ns: preamble-detect timestamp (better)
+	TAccNs       uint32 // station_t_acc_ns (clock-discipline class)
+	// PrecomputedClass is the timestamp class the caller has already
+	// resolved for this observation (e.g. via ClockSync.CorrectAndClassify).
+	// Only consulted when HasPrecomputedClass is true. Keeping the
+	// "is set" flag explicit means TimestampSample (the zero value)
+	// can be a real class -- which it will become for GPSDO / sample-
+	// epoch observations in the next tier of work.
+	PrecomputedClass    TimestampClass
+	HasPrecomputedClass bool
+}
+
+// resolveTNs picks the best available timestamp from an observation
+// and returns the value plus its class. When HasPrecomputedClass is
+// true, the caller-supplied class wins. Otherwise infer from
+// LockTNs/TNs presence: software_lock > frame.
+func (o MlatObservation) resolveTNs() (uint64, TimestampClass) {
+	if o.HasPrecomputedClass {
+		if o.LockTNs != 0 {
+			return o.LockTNs, o.PrecomputedClass
+		}
+		return o.TNs, o.PrecomputedClass
+	}
+	if o.LockTNs != 0 {
+		return o.LockTNs, TimestampSoftwareLock
+	}
+	return o.TNs, TimestampFrame
 }
 
 // MlatResult is the solver's emitter-position estimate.
 type MlatResult struct {
-	Lat, Lon       float64 // estimated emitter position
-	UncertaintyM   float64 // 1-sigma residual in meters
-	Iterations     int     // how many Newton iterations until convergence
-	StationCount   int     // observations consumed
+	Lat, Lon          float64 // estimated emitter position
+	UncertaintyM      float64 // 1-sigma residual in meters
+	Iterations        int     // how many Newton iterations until convergence
+	StationCount      int     // observations consumed
+	TimestampClasses  map[TimestampClass]int // count of obs by timestamp source
+	WorstTimestampCls TimestampClass         // weakest class consumed; uncertainty floor
+	Degraded          bool                   // true when a mix of classes was used
+	// Clock-sync diagnostics, populated by the fusion event loop after
+	// solver returns. Surfaced on the GEOLOCATED JSON for operator UI.
+	ClockSyncPairCount    int     // converged pairs touching contributing stations
+	ClockSyncResidualNs   float64 // max MAD across contributing pairs
+	ClockSyncAnchorCount  int     // distinct anchors that contributed to the converged pairs
+	ClockSyncReference    string  // station chosen as the network time reference (or "")
 }
 
 // Solve runs hyperbolic-TDOA multilateration. Requires at least 3
@@ -83,17 +144,42 @@ func Solve(obs []MlatObservation) (*MlatResult, error) {
 	anchorLat /= float64(len(obs))
 	anchorLon /= float64(len(obs))
 
+	// Resolve each observation's best-available timestamp + class.
+	// LockTNs (software_lock) wins over TNs (frame) when present; the
+	// "sample" class lands in a future branch and is not produced
+	// here yet.
+	resolved := make([]uint64, len(obs))
+	classes := make([]TimestampClass, len(obs))
+	classCounts := map[TimestampClass]int{}
+	for i := range obs {
+		resolved[i], classes[i] = obs[i].resolveTNs()
+		classCounts[classes[i]]++
+	}
+
 	// Rebase TNs in uint64 space BEFORE converting to seconds. At
 	// epoch-class magnitudes (~1.7e18 ns), float64 has only ~64 ns
 	// of precision -- doing `TNs*1e-9` directly loses the nanosecond
 	// LSBs we need for mlat. Subtracting a common epoch in uint64 first
 	// keeps the resulting differences in a precision-safe range.
-	minTNs := obs[0].TNs
-	for i := range obs {
-		if obs[i].TNs < minTNs {
-			minTNs = obs[i].TNs
+	minTNs := resolved[0]
+	for i := range resolved {
+		if resolved[i] < minTNs {
+			minTNs = resolved[i]
 		}
 	}
+
+	// Mixing timestamp classes across stations means the solver is
+	// fed observations whose pipeline latencies disagree by tens of
+	// milliseconds -- a "frame" obs in the same solve as a
+	// "software_lock" obs poisons the result. Flag the solve as
+	// degraded so the caller can mark/inflate uncertainty.
+	worstClass := TimestampSample
+	for _, c := range classes {
+		if c > worstClass {
+			worstClass = c
+		}
+	}
+	degraded := len(classCounts) > 1
 
 	// Project each station to ENU (meters from anchor).
 	stations := make([]mlatStation, len(obs))
@@ -101,7 +187,7 @@ func Solve(obs []MlatObservation) (*MlatResult, error) {
 		x, y := llToEnu(obs[i].Lat, obs[i].Lon, anchorLat, anchorLon)
 		stations[i] = mlatStation{
 			x: x, y: y, z: obs[i].AltM,
-			t: float64(obs[i].TNs-minTNs) * 1e-9,
+			t: float64(resolved[i]-minTNs) * 1e-9,
 			w: 1.0 / float64(maxU32(obs[i].TAccNs, 1)),
 		}
 	}
@@ -151,11 +237,14 @@ func Solve(obs []MlatObservation) (*MlatResult, error) {
 	uncertainty := math.Sqrt(residual / float64(dof))
 
 	return &MlatResult{
-		Lat:          emitterLat,
-		Lon:          emitterLon,
-		UncertaintyM: uncertainty,
-		Iterations:   iter,
-		StationCount: len(stations),
+		Lat:               emitterLat,
+		Lon:               emitterLon,
+		UncertaintyM:      uncertainty,
+		Iterations:        iter,
+		StationCount:      len(stations),
+		TimestampClasses:  classCounts,
+		WorstTimestampCls: worstClass,
+		Degraded:          degraded,
 	}, nil
 }
 

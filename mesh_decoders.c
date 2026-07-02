@@ -30,7 +30,26 @@ static float u32_as_float(uint32_t v)
     return f;
 }
 
-/* ---- POSITION_APP -- meshtastic.Position ---- */
+/* ---- POSITION_APP -- meshtastic.Position ----
+ *
+ * Field tag and wire type discipline:
+ *   1  sfixed32 latitude_i               -> wire type 5 (fixed32), signed
+ *   2  sfixed32 longitude_i              -> wire type 5 (fixed32), signed
+ *   3  int32    altitude (MSL)           -> wire type 0 (varint)
+ *   4  fixed32  time (sender wall)       -> wire type 5 (fixed32), unsigned
+ *   5  LocSource location_source         -> wire type 0 (varint)
+ *   6  AltSource altitude_source         -> wire type 0 (varint)
+ *   7  fixed32  timestamp (GPS fix)      -> wire type 5 (fixed32), unsigned
+ *   8  int32    timestamp_millis_adjust  -> wire type 0 (varint), signed
+ *   9  sint32   altitude_hae             -> wire type 0 (varint), zigzag
+ *  10  sint32   altitude_geoidal_sep     -> wire type 0 (varint), zigzag
+ *  11..23 uint32 fields per the proto   -> wire type 0 (varint)
+ *
+ * Wire-type-aware: if a tag comes in with an unexpected wire type for its
+ * field number, the value is skipped rather than misparsed. This avoids
+ * the prior class of bug where field 1 was read as varint even though
+ * sfixed32 is wire-type 5 (always returned 0,0 in practice).
+ */
 bool mesh_decode_position(const uint8_t *buf, size_t len, mesh_position_t *out)
 {
     if (!buf || !out) return false;
@@ -40,34 +59,96 @@ bool mesh_decode_position(const uint8_t *buf, size_t len, mesh_position_t *out)
     while (p < end) {
         uint32_t fld, wt;
         if (!pb_read_tag(&p, end, &fld, &wt)) return false;
+        uint32_t f32; uint64_t v;
         switch (fld) {
-        case 1: { uint64_t v; if (!pb_read_varint(&p, end, &v)) return false;
-                  out->lat_deg  = (double)pb_zigzag32((uint32_t)v) * 1e-7;
-                  out->have_lat = true; break; }
-        case 2: { uint64_t v; if (!pb_read_varint(&p, end, &v)) return false;
-                  out->lon_deg  = (double)pb_zigzag32((uint32_t)v) * 1e-7;
-                  out->have_lon = true; break; }
-        case 3: { uint64_t v; if (!pb_read_varint(&p, end, &v)) return false;
-                  out->altitude_m = (int32_t)v;
-                  out->have_alt = true; break; }
-        case 9: { uint32_t v; if (!pb_read_fixed32(&p, end, &v)) return false;
-                  out->time_unix = v; break; }
-        case 5: { uint64_t v; if (!pb_read_varint(&p, end, &v)) return false;
-                  out->location_source = (uint32_t)v; break; }
-        case 12:{ uint64_t v; if (!pb_read_varint(&p, end, &v)) return false;
-                  out->sats_in_view = (uint32_t)v; break; }
-        case 15:{ uint64_t v; if (!pb_read_varint(&p, end, &v)) return false;
-                  out->pdop_x100 = (uint32_t)v; break; }
-        case 16:{ uint64_t v; if (!pb_read_varint(&p, end, &v)) return false;
-                  out->ground_speed_mps = (uint32_t)v; break; }
-        case 17:{ uint64_t v; if (!pb_read_varint(&p, end, &v)) return false;
-                  out->ground_track = (uint32_t)v; break; }
-        case 18:{ uint64_t v; if (!pb_read_varint(&p, end, &v)) return false;
-                  out->precision_bits = (uint32_t)v; break; }
-        default: if (!pb_skip_value(&p, end, wt)) return false; break;
+        /* sfixed32 lat/lon: 4 bytes little-endian, two's-complement signed,
+         * scaled 1e-7 to degrees. */
+        case 1:
+            if (wt != 5 || !pb_read_fixed32(&p, end, &f32)) { if (!pb_skip_value(&p, end, wt)) return false; break; }
+            out->lat_deg  = (double)(int32_t)f32 * 1e-7;
+            out->have_lat = true; break;
+        case 2:
+            if (wt != 5 || !pb_read_fixed32(&p, end, &f32)) { if (!pb_skip_value(&p, end, wt)) return false; break; }
+            out->lon_deg  = (double)(int32_t)f32 * 1e-7;
+            out->have_lon = true; break;
+        case 3:
+            if (wt != 0 || !pb_read_varint(&p, end, &v)) { if (!pb_skip_value(&p, end, wt)) return false; break; }
+            out->altitude_m = (int32_t)v;
+            out->have_alt = true; break;
+        case 4:
+            if (wt != 5 || !pb_read_fixed32(&p, end, &f32)) { if (!pb_skip_value(&p, end, wt)) return false; break; }
+            out->time = f32;
+            out->have_time = true; break;
+        case 5:
+            if (wt != 0 || !pb_read_varint(&p, end, &v)) { if (!pb_skip_value(&p, end, wt)) return false; break; }
+            out->location_source = (uint32_t)v; break;
+        case 6:
+            if (wt != 0 || !pb_read_varint(&p, end, &v)) { if (!pb_skip_value(&p, end, wt)) return false; break; }
+            out->altitude_source = (uint32_t)v; break;
+        case 7:
+            if (wt != 5 || !pb_read_fixed32(&p, end, &f32)) { if (!pb_skip_value(&p, end, wt)) return false; break; }
+            out->timestamp = f32;
+            out->have_timestamp = true; break;
+        case 8:
+            if (wt != 0 || !pb_read_varint(&p, end, &v)) { if (!pb_skip_value(&p, end, wt)) return false; break; }
+            out->timestamp_millis_adjust = (int32_t)v; break;
+        /* sint32 fields: varint + zigzag */
+        case 9:
+            if (wt != 0 || !pb_read_varint(&p, end, &v)) { if (!pb_skip_value(&p, end, wt)) return false; break; }
+            out->altitude_hae_m = pb_zigzag32((uint32_t)v);
+            out->have_alt_hae = true; break;
+        case 10:
+            if (wt != 0 || !pb_read_varint(&p, end, &v)) { if (!pb_skip_value(&p, end, wt)) return false; break; }
+            out->altitude_geoidal_separation_m = pb_zigzag32((uint32_t)v);
+            out->have_alt_geosep = true; break;
+        /* uint32 varint fields 11..23 */
+        case 11:
+            if (wt != 0 || !pb_read_varint(&p, end, &v)) { if (!pb_skip_value(&p, end, wt)) return false; break; }
+            out->pdop_x100 = (uint32_t)v; break;
+        case 12:
+            if (wt != 0 || !pb_read_varint(&p, end, &v)) { if (!pb_skip_value(&p, end, wt)) return false; break; }
+            out->hdop_x100 = (uint32_t)v; break;
+        case 13:
+            if (wt != 0 || !pb_read_varint(&p, end, &v)) { if (!pb_skip_value(&p, end, wt)) return false; break; }
+            out->vdop_x100 = (uint32_t)v; break;
+        case 14:
+            if (wt != 0 || !pb_read_varint(&p, end, &v)) { if (!pb_skip_value(&p, end, wt)) return false; break; }
+            out->gps_accuracy_mm = (uint32_t)v; break;
+        case 15:
+            if (wt != 0 || !pb_read_varint(&p, end, &v)) { if (!pb_skip_value(&p, end, wt)) return false; break; }
+            out->ground_speed_mps = (uint32_t)v;
+            out->have_ground_speed = true; break;
+        case 16:
+            if (wt != 0 || !pb_read_varint(&p, end, &v)) { if (!pb_skip_value(&p, end, wt)) return false; break; }
+            out->ground_track_x100 = (uint32_t)v;
+            out->have_ground_track = true; break;
+        case 17:
+            if (wt != 0 || !pb_read_varint(&p, end, &v)) { if (!pb_skip_value(&p, end, wt)) return false; break; }
+            out->fix_quality = (uint32_t)v; break;
+        case 18:
+            if (wt != 0 || !pb_read_varint(&p, end, &v)) { if (!pb_skip_value(&p, end, wt)) return false; break; }
+            out->fix_type = (uint32_t)v; break;
+        case 19:
+            if (wt != 0 || !pb_read_varint(&p, end, &v)) { if (!pb_skip_value(&p, end, wt)) return false; break; }
+            out->sats_in_view = (uint32_t)v; break;
+        case 20:
+            if (wt != 0 || !pb_read_varint(&p, end, &v)) { if (!pb_skip_value(&p, end, wt)) return false; break; }
+            out->sensor_id = (uint32_t)v; break;
+        case 21:
+            if (wt != 0 || !pb_read_varint(&p, end, &v)) { if (!pb_skip_value(&p, end, wt)) return false; break; }
+            out->next_update_s = (uint32_t)v; break;
+        case 22:
+            if (wt != 0 || !pb_read_varint(&p, end, &v)) { if (!pb_skip_value(&p, end, wt)) return false; break; }
+            out->seq_number = (uint32_t)v; break;
+        case 23:
+            if (wt != 0 || !pb_read_varint(&p, end, &v)) { if (!pb_skip_value(&p, end, wt)) return false; break; }
+            out->precision_bits = (uint32_t)v; break;
+        default:
+            if (!pb_skip_value(&p, end, wt)) return false;
+            break;
         }
     }
-    return out->have_lat || out->have_lon || out->time_unix != 0;
+    return out->have_lat || out->have_lon || out->have_time || out->have_timestamp;
 }
 
 /* ---- NODEINFO_APP -- meshtastic.User ---- */
@@ -96,6 +177,8 @@ bool mesh_decode_user(const uint8_t *buf, size_t len, mesh_user_t *out)
         case 8: if (!pb_read_length(&p, end, &bp, &blen)) return false;
                 if (blen <= sizeof(out->public_key)) { memcpy(out->public_key, bp, blen); out->have_public_key = true; }
                 break;
+        case 9: if (!pb_read_varint(&p, end, &v)) return false;
+                out->is_unmessagable = v != 0; out->have_is_unmessagable = true; break;
         default: if (!pb_skip_value(&p, end, wt)) return false; break;
         }
     }
@@ -132,31 +215,77 @@ static void parse_device_metrics(const uint8_t *buf, size_t len, mesh_telemetry_
     out->have_device = true;
 }
 
+/* EnvironmentMetrics: float fields are wire-type 5 fixed32 (read as u32
+ * then bit-cast); iaq, wind_direction, soil_moisture are uint32 varint
+ * (wire-type 0). Field numbers and types mirror the current upstream
+ * proto, including a swap that previously had wind_gust/wind_lull living
+ * on the wrong field numbers. */
 static void parse_env_metrics(const uint8_t *buf, size_t len, mesh_telemetry_t *out)
 {
     const uint8_t *p = buf, *end = buf + len;
     while (p < end) {
         uint32_t fld, wt;
         if (!pb_read_tag(&p, end, &fld, &wt)) return;
-        uint32_t f32;
+        uint32_t f32; uint64_t v;
         switch (fld) {
-        case 1: if (!pb_read_fixed32(&p, end, &f32)) return; out->temperature_c           = u32_as_float(f32); break;
-        case 2: if (!pb_read_fixed32(&p, end, &f32)) return; out->relative_humidity       = u32_as_float(f32); break;
-        case 3: if (!pb_read_fixed32(&p, end, &f32)) return; out->barometric_pressure_hpa = u32_as_float(f32); break;
-        case 4: if (!pb_read_fixed32(&p, end, &f32)) return; out->gas_resistance          = u32_as_float(f32); break;
-        case 5: if (!pb_read_fixed32(&p, end, &f32)) return; out->voltage_env             = u32_as_float(f32); break;
-        case 6: if (!pb_read_fixed32(&p, end, &f32)) return; out->current                 = u32_as_float(f32); break;
-        case 7: if (!pb_read_fixed32(&p, end, &f32)) return; out->iaq                     = u32_as_float(f32); break;
-        case 8: if (!pb_read_fixed32(&p, end, &f32)) return; out->distance_mm             = u32_as_float(f32); break;
-        case 9: if (!pb_read_fixed32(&p, end, &f32)) return; out->lux                     = u32_as_float(f32); break;
-        case 10:if (!pb_read_fixed32(&p, end, &f32)) return; out->white_lux               = u32_as_float(f32); break;
-        case 11:if (!pb_read_fixed32(&p, end, &f32)) return; out->ir_lumens               = u32_as_float(f32); break;
-        case 12:if (!pb_read_fixed32(&p, end, &f32)) return; out->uv_lux                  = u32_as_float(f32); break;
-        case 13:if (!pb_read_fixed32(&p, end, &f32)) return; out->wind_direction          = u32_as_float(f32); break;
-        case 14:if (!pb_read_fixed32(&p, end, &f32)) return; out->wind_speed              = u32_as_float(f32); break;
-        case 15:if (!pb_read_fixed32(&p, end, &f32)) return; out->wind_gust               = u32_as_float(f32); break;
-        case 16:if (!pb_read_fixed32(&p, end, &f32)) return; out->wind_lull               = u32_as_float(f32); break;
-        default: if (!pb_skip_value(&p, end, wt)) return; break;
+        case 1:  if (wt != 5 || !pb_read_fixed32(&p, end, &f32)) { if (!pb_skip_value(&p, end, wt)) return; break; }
+                 out->temperature_c           = u32_as_float(f32); break;
+        case 2:  if (wt != 5 || !pb_read_fixed32(&p, end, &f32)) { if (!pb_skip_value(&p, end, wt)) return; break; }
+                 out->relative_humidity       = u32_as_float(f32); break;
+        case 3:  if (wt != 5 || !pb_read_fixed32(&p, end, &f32)) { if (!pb_skip_value(&p, end, wt)) return; break; }
+                 out->barometric_pressure_hpa = u32_as_float(f32); break;
+        case 4:  if (wt != 5 || !pb_read_fixed32(&p, end, &f32)) { if (!pb_skip_value(&p, end, wt)) return; break; }
+                 out->gas_resistance          = u32_as_float(f32); break;
+        case 5:  if (wt != 5 || !pb_read_fixed32(&p, end, &f32)) { if (!pb_skip_value(&p, end, wt)) return; break; }
+                 out->voltage_env             = u32_as_float(f32); break;
+        case 6:  if (wt != 5 || !pb_read_fixed32(&p, end, &f32)) { if (!pb_skip_value(&p, end, wt)) return; break; }
+                 out->current                 = u32_as_float(f32); break;
+        /* field 7: iaq is uint32, not float. Was previously read as fixed32
+         * so the reported value was garbage (e.g. an air-quality index of
+         * a few hundred showed as a denormal/huge float). */
+        case 7:  if (wt != 0 || !pb_read_varint(&p, end, &v)) { if (!pb_skip_value(&p, end, wt)) return; break; }
+                 out->iaq = (uint32_t)v; break;
+        case 8:  if (wt != 5 || !pb_read_fixed32(&p, end, &f32)) { if (!pb_skip_value(&p, end, wt)) return; break; }
+                 out->distance_mm             = u32_as_float(f32); break;
+        case 9:  if (wt != 5 || !pb_read_fixed32(&p, end, &f32)) { if (!pb_skip_value(&p, end, wt)) return; break; }
+                 out->lux                     = u32_as_float(f32); break;
+        case 10: if (wt != 5 || !pb_read_fixed32(&p, end, &f32)) { if (!pb_skip_value(&p, end, wt)) return; break; }
+                 out->white_lux               = u32_as_float(f32); break;
+        case 11: if (wt != 5 || !pb_read_fixed32(&p, end, &f32)) { if (!pb_skip_value(&p, end, wt)) return; break; }
+                 out->ir_lux                  = u32_as_float(f32); break;
+        case 12: if (wt != 5 || !pb_read_fixed32(&p, end, &f32)) { if (!pb_skip_value(&p, end, wt)) return; break; }
+                 out->uv_lux                  = u32_as_float(f32); break;
+        /* field 13: wind_direction is uint32, not float. */
+        case 13: if (wt != 0 || !pb_read_varint(&p, end, &v)) { if (!pb_skip_value(&p, end, wt)) return; break; }
+                 out->wind_direction = (uint32_t)v; break;
+        case 14: if (wt != 5 || !pb_read_fixed32(&p, end, &f32)) { if (!pb_skip_value(&p, end, wt)) return; break; }
+                 out->wind_speed              = u32_as_float(f32); break;
+        /* fields 15..17 were previously shifted: we had wind_gust on
+         * field 15 (which is actually `weight`), wind_lull on field 16
+         * (which is actually wind_gust), and didn't read field 17 at all
+         * (which is wind_lull). Realign with the current proto. */
+        case 15: if (wt != 5 || !pb_read_fixed32(&p, end, &f32)) { if (!pb_skip_value(&p, end, wt)) return; break; }
+                 out->weight                  = u32_as_float(f32); break;
+        case 16: if (wt != 5 || !pb_read_fixed32(&p, end, &f32)) { if (!pb_skip_value(&p, end, wt)) return; break; }
+                 out->wind_gust               = u32_as_float(f32); break;
+        case 17: if (wt != 5 || !pb_read_fixed32(&p, end, &f32)) { if (!pb_skip_value(&p, end, wt)) return; break; }
+                 out->wind_lull               = u32_as_float(f32); break;
+        /* Newer sensor fields (radiation, rainfall, soil_*) -- surface
+         * the common ones so a Geiger or weather-station node shows up
+         * with real data instead of getting silently dropped. */
+        case 18: if (wt != 5 || !pb_read_fixed32(&p, end, &f32)) { if (!pb_skip_value(&p, end, wt)) return; break; }
+                 out->radiation_uSvh          = u32_as_float(f32); break;
+        case 19: if (wt != 5 || !pb_read_fixed32(&p, end, &f32)) { if (!pb_skip_value(&p, end, wt)) return; break; }
+                 out->rainfall_1h_mm          = u32_as_float(f32); break;
+        case 20: if (wt != 5 || !pb_read_fixed32(&p, end, &f32)) { if (!pb_skip_value(&p, end, wt)) return; break; }
+                 out->rainfall_24h_mm         = u32_as_float(f32); break;
+        case 21: if (wt != 0 || !pb_read_varint(&p, end, &v)) { if (!pb_skip_value(&p, end, wt)) return; break; }
+                 out->soil_moisture = (uint32_t)v; break;
+        case 22: if (wt != 5 || !pb_read_fixed32(&p, end, &f32)) { if (!pb_skip_value(&p, end, wt)) return; break; }
+                 out->soil_temperature_c      = u32_as_float(f32); break;
+        default:
+            if (!pb_skip_value(&p, end, wt)) return;
+            break;
         }
     }
     out->have_environment = true;
@@ -170,16 +299,152 @@ static void parse_power_metrics(const uint8_t *buf, size_t len, mesh_telemetry_t
         if (!pb_read_tag(&p, end, &fld, &wt)) return;
         uint32_t f32;
         switch (fld) {
-        case 1: if (!pb_read_fixed32(&p, end, &f32)) return; out->ch1_voltage = u32_as_float(f32); break;
-        case 2: if (!pb_read_fixed32(&p, end, &f32)) return; out->ch1_current = u32_as_float(f32); break;
-        case 3: if (!pb_read_fixed32(&p, end, &f32)) return; out->ch2_voltage = u32_as_float(f32); break;
-        case 4: if (!pb_read_fixed32(&p, end, &f32)) return; out->ch2_current = u32_as_float(f32); break;
-        case 5: if (!pb_read_fixed32(&p, end, &f32)) return; out->ch3_voltage = u32_as_float(f32); break;
-        case 6: if (!pb_read_fixed32(&p, end, &f32)) return; out->ch3_current = u32_as_float(f32); break;
+        case 1:  if (!pb_read_fixed32(&p, end, &f32)) return; out->ch1_voltage = u32_as_float(f32); break;
+        case 2:  if (!pb_read_fixed32(&p, end, &f32)) return; out->ch1_current = u32_as_float(f32); break;
+        case 3:  if (!pb_read_fixed32(&p, end, &f32)) return; out->ch2_voltage = u32_as_float(f32); break;
+        case 4:  if (!pb_read_fixed32(&p, end, &f32)) return; out->ch2_current = u32_as_float(f32); break;
+        case 5:  if (!pb_read_fixed32(&p, end, &f32)) return; out->ch3_voltage = u32_as_float(f32); break;
+        case 6:  if (!pb_read_fixed32(&p, end, &f32)) return; out->ch3_current = u32_as_float(f32); break;
+        case 7:  if (!pb_read_fixed32(&p, end, &f32)) return; out->ch4_voltage = u32_as_float(f32); break;
+        case 8:  if (!pb_read_fixed32(&p, end, &f32)) return; out->ch4_current = u32_as_float(f32); break;
+        case 9:  if (!pb_read_fixed32(&p, end, &f32)) return; out->ch5_voltage = u32_as_float(f32); break;
+        case 10: if (!pb_read_fixed32(&p, end, &f32)) return; out->ch5_current = u32_as_float(f32); break;
+        case 11: if (!pb_read_fixed32(&p, end, &f32)) return; out->ch6_voltage = u32_as_float(f32); break;
+        case 12: if (!pb_read_fixed32(&p, end, &f32)) return; out->ch6_current = u32_as_float(f32); break;
+        case 13: if (!pb_read_fixed32(&p, end, &f32)) return; out->ch7_voltage = u32_as_float(f32); break;
+        case 14: if (!pb_read_fixed32(&p, end, &f32)) return; out->ch7_current = u32_as_float(f32); break;
+        case 15: if (!pb_read_fixed32(&p, end, &f32)) return; out->ch8_voltage = u32_as_float(f32); break;
+        case 16: if (!pb_read_fixed32(&p, end, &f32)) return; out->ch8_current = u32_as_float(f32); break;
         default: if (!pb_skip_value(&p, end, wt)) return; break;
         }
     }
     out->have_power = true;
+}
+
+static void parse_air_quality(const uint8_t *buf, size_t len, mesh_telemetry_t *out)
+{
+    const uint8_t *p = buf, *end = buf + len;
+    while (p < end) {
+        uint32_t fld, wt; uint64_t v; uint32_t f32;
+        if (!pb_read_tag(&p, end, &fld, &wt)) return;
+        switch (fld) {
+        case 1:  if (!pb_read_varint(&p, end, &v)) return; out->aq_pm10_standard = (uint32_t)v; break;
+        case 2:  if (!pb_read_varint(&p, end, &v)) return; out->aq_pm25_standard = (uint32_t)v; break;
+        case 3:  if (!pb_read_varint(&p, end, &v)) return; out->aq_pm100_standard = (uint32_t)v; break;
+        case 4:  if (!pb_read_varint(&p, end, &v)) return; out->aq_pm10_env = (uint32_t)v; break;
+        case 5:  if (!pb_read_varint(&p, end, &v)) return; out->aq_pm25_env = (uint32_t)v; break;
+        case 6:  if (!pb_read_varint(&p, end, &v)) return; out->aq_pm100_env = (uint32_t)v; break;
+        case 7:  if (!pb_read_varint(&p, end, &v)) return; out->aq_particles_03um = (uint32_t)v; break;
+        case 8:  if (!pb_read_varint(&p, end, &v)) return; out->aq_particles_05um = (uint32_t)v; break;
+        case 9:  if (!pb_read_varint(&p, end, &v)) return; out->aq_particles_10um = (uint32_t)v; break;
+        case 10: if (!pb_read_varint(&p, end, &v)) return; out->aq_particles_25um = (uint32_t)v; break;
+        case 11: if (!pb_read_varint(&p, end, &v)) return; out->aq_particles_50um = (uint32_t)v; break;
+        case 12: if (!pb_read_varint(&p, end, &v)) return; out->aq_particles_100um = (uint32_t)v; break;
+        case 13: if (!pb_read_varint(&p, end, &v)) return; out->aq_co2 = (uint32_t)v; break;
+        case 14: if (!pb_read_fixed32(&p, end, &f32)) return; out->aq_co2_temperature_c = u32_as_float(f32); break;
+        case 15: if (!pb_read_fixed32(&p, end, &f32)) return; out->aq_co2_humidity = u32_as_float(f32); break;
+        case 16: if (!pb_read_fixed32(&p, end, &f32)) return; out->aq_formaldehyde_ppb = u32_as_float(f32); break;
+        case 17: if (!pb_read_fixed32(&p, end, &f32)) return; out->aq_form_humidity = u32_as_float(f32); break;
+        case 18: if (!pb_read_fixed32(&p, end, &f32)) return; out->aq_form_temperature_c = u32_as_float(f32); break;
+        case 19: if (!pb_read_varint(&p, end, &v)) return; out->aq_pm40_standard = (uint32_t)v; break;
+        case 20: if (!pb_read_varint(&p, end, &v)) return; out->aq_particles_40um = (uint32_t)v; break;
+        case 21: if (!pb_read_fixed32(&p, end, &f32)) return; out->aq_pm_temperature_c = u32_as_float(f32); break;
+        case 22: if (!pb_read_fixed32(&p, end, &f32)) return; out->aq_pm_humidity = u32_as_float(f32); break;
+        case 23: if (!pb_read_fixed32(&p, end, &f32)) return; out->aq_pm_voc_idx = u32_as_float(f32); break;
+        case 24: if (!pb_read_fixed32(&p, end, &f32)) return; out->aq_pm_nox_idx = u32_as_float(f32); break;
+        case 25: if (!pb_read_fixed32(&p, end, &f32)) return; out->aq_particles_tps = u32_as_float(f32); break;
+        default: if (!pb_skip_value(&p, end, wt)) return; break;
+        }
+    }
+    out->have_air_quality = true;
+}
+
+static void parse_local_stats(const uint8_t *buf, size_t len, mesh_telemetry_t *out)
+{
+    const uint8_t *p = buf, *end = buf + len;
+    while (p < end) {
+        uint32_t fld, wt; uint64_t v; uint32_t f32;
+        if (!pb_read_tag(&p, end, &fld, &wt)) return;
+        switch (fld) {
+        case 1:  if (!pb_read_varint(&p, end, &v)) return; out->local_uptime_s = (uint32_t)v; break;
+        case 2:  if (!pb_read_fixed32(&p, end, &f32)) return; out->local_channel_utilization = u32_as_float(f32); break;
+        case 3:  if (!pb_read_fixed32(&p, end, &f32)) return; out->local_air_util_tx = u32_as_float(f32); break;
+        case 4:  if (!pb_read_varint(&p, end, &v)) return; out->local_num_packets_tx = (uint32_t)v; break;
+        case 5:  if (!pb_read_varint(&p, end, &v)) return; out->local_num_packets_rx = (uint32_t)v; break;
+        case 6:  if (!pb_read_varint(&p, end, &v)) return; out->local_num_packets_rx_bad = (uint32_t)v; break;
+        case 7:  if (!pb_read_varint(&p, end, &v)) return; out->local_num_online_nodes = (uint32_t)v; break;
+        case 8:  if (!pb_read_varint(&p, end, &v)) return; out->local_num_total_nodes = (uint32_t)v; break;
+        case 9:  if (!pb_read_varint(&p, end, &v)) return; out->local_num_rx_dupe = (uint32_t)v; break;
+        case 10: if (!pb_read_varint(&p, end, &v)) return; out->local_num_tx_relay = (uint32_t)v; break;
+        case 11: if (!pb_read_varint(&p, end, &v)) return; out->local_num_tx_relay_canceled = (uint32_t)v; break;
+        case 12: if (!pb_read_varint(&p, end, &v)) return; out->local_heap_total_bytes = (uint32_t)v; break;
+        case 13: if (!pb_read_varint(&p, end, &v)) return; out->local_heap_free_bytes = (uint32_t)v; break;
+        case 14: if (!pb_read_varint(&p, end, &v)) return; out->local_num_tx_dropped = (uint32_t)v; break;
+        case 15: if (!pb_read_varint(&p, end, &v)) return; out->local_noise_floor_dbm = (int32_t)(int64_t)v; break;
+        default: if (!pb_skip_value(&p, end, wt)) return; break;
+        }
+    }
+    out->have_local_stats = true;
+}
+
+static void parse_health(const uint8_t *buf, size_t len, mesh_telemetry_t *out)
+{
+    const uint8_t *p = buf, *end = buf + len;
+    while (p < end) {
+        uint32_t fld, wt; uint64_t v; uint32_t f32;
+        if (!pb_read_tag(&p, end, &fld, &wt)) return;
+        switch (fld) {
+        case 1: if (!pb_read_varint(&p, end, &v)) return; out->health_heart_bpm = (uint32_t)v; break;
+        case 2: if (!pb_read_varint(&p, end, &v)) return; out->health_spo2 = (uint32_t)v; break;
+        case 3: if (!pb_read_fixed32(&p, end, &f32)) return; out->health_temperature_c = u32_as_float(f32); break;
+        default: if (!pb_skip_value(&p, end, wt)) return; break;
+        }
+    }
+    out->have_health = true;
+}
+
+static void parse_host(const uint8_t *buf, size_t len, mesh_telemetry_t *out)
+{
+    const uint8_t *p = buf, *end = buf + len;
+    while (p < end) {
+        uint32_t fld, wt; uint64_t v;
+        if (!pb_read_tag(&p, end, &fld, &wt)) return;
+        const uint8_t *bp; size_t blen;
+        switch (fld) {
+        case 1: if (!pb_read_varint(&p, end, &v)) return; out->host_uptime_s = (uint32_t)v; break;
+        case 2: if (!pb_read_varint(&p, end, &v)) return; out->host_freemem_bytes = v; break;
+        case 3: if (!pb_read_varint(&p, end, &v)) return; out->host_diskfree1_bytes = v; break;
+        case 4: if (!pb_read_varint(&p, end, &v)) return; out->host_diskfree2_bytes = v; break;
+        case 5: if (!pb_read_varint(&p, end, &v)) return; out->host_diskfree3_bytes = v; break;
+        case 6: if (!pb_read_varint(&p, end, &v)) return; out->host_load1_x100 = (uint32_t)v; break;
+        case 7: if (!pb_read_varint(&p, end, &v)) return; out->host_load5_x100 = (uint32_t)v; break;
+        case 8: if (!pb_read_varint(&p, end, &v)) return; out->host_load15_x100 = (uint32_t)v; break;
+        case 9: if (!pb_read_length(&p, end, &bp, &blen)) return;
+                copy_str(out->host_user_string, sizeof(out->host_user_string), bp, blen); break;
+        default: if (!pb_skip_value(&p, end, wt)) return; break;
+        }
+    }
+    out->have_host = true;
+}
+
+static void parse_traffic_mgmt(const uint8_t *buf, size_t len, mesh_telemetry_t *out)
+{
+    const uint8_t *p = buf, *end = buf + len;
+    while (p < end) {
+        uint32_t fld, wt; uint64_t v;
+        if (!pb_read_tag(&p, end, &fld, &wt)) return;
+        switch (fld) {
+        case 1: if (!pb_read_varint(&p, end, &v)) return; out->tm_packets_inspected = (uint32_t)v; break;
+        case 2: if (!pb_read_varint(&p, end, &v)) return; out->tm_position_dedup_drops = (uint32_t)v; break;
+        case 3: if (!pb_read_varint(&p, end, &v)) return; out->tm_nodeinfo_cache_hits = (uint32_t)v; break;
+        case 4: if (!pb_read_varint(&p, end, &v)) return; out->tm_rate_limit_drops = (uint32_t)v; break;
+        case 5: if (!pb_read_varint(&p, end, &v)) return; out->tm_unknown_packet_drops = (uint32_t)v; break;
+        case 6: if (!pb_read_varint(&p, end, &v)) return; out->tm_hop_exhausted_packets = (uint32_t)v; break;
+        case 7: if (!pb_read_varint(&p, end, &v)) return; out->tm_router_hops_preserved = (uint32_t)v; break;
+        default: if (!pb_skip_value(&p, end, wt)) return; break;
+        }
+    }
+    out->have_traffic_mgmt = true;
 }
 
 bool mesh_decode_telemetry(const uint8_t *buf, size_t len, mesh_telemetry_t *out)
@@ -199,41 +464,50 @@ bool mesh_decode_telemetry(const uint8_t *buf, size_t len, mesh_telemetry_t *out
                 parse_device_metrics(bp, blen, out); any = true; break;
         case 3: if (!pb_read_length(&p, end, &bp, &blen)) return any;
                 parse_env_metrics(bp, blen, out); any = true; break;
+        case 4: if (!pb_read_length(&p, end, &bp, &blen)) return any;
+                parse_air_quality(bp, blen, out); any = true; break;
         case 5: if (!pb_read_length(&p, end, &bp, &blen)) return any;
                 parse_power_metrics(bp, blen, out); any = true; break;
+        case 6: if (!pb_read_length(&p, end, &bp, &blen)) return any;
+                parse_local_stats(bp, blen, out); any = true; break;
+        case 7: if (!pb_read_length(&p, end, &bp, &blen)) return any;
+                parse_health(bp, blen, out); any = true; break;
+        case 8: if (!pb_read_length(&p, end, &bp, &blen)) return any;
+                parse_host(bp, blen, out); any = true; break;
+        case 9: if (!pb_read_length(&p, end, &bp, &blen)) return any;
+                parse_traffic_mgmt(bp, blen, out); any = true; break;
         default: if (!pb_skip_value(&p, end, wt)) return any; break;
         }
     }
     return any;
 }
 
-/* RouteDiscovery sub-message: repeated fixed32 route = 1. We pull the
- * node-ID path; per-hop SNRs (fields 2/4) and reverse path (field 3)
- * skipped for now. */
+/* RouteDiscovery sub-message: repeated uint32 route = 1 (varint),
+ * repeated int32 snr_towards = 2, repeated uint32 route_back = 3,
+ * repeated int32 snr_back = 4. We surface the node-ID path; SNRs and
+ * reverse path skipped for now. */
 static void parse_route_discovery(const uint8_t *buf, size_t len, mesh_routing_t *out)
 {
+    const int route_cap = (int)(sizeof(out->route)/sizeof(out->route[0]));
     const uint8_t *p = buf, *end = buf + len;
     while (p < end) {
         uint32_t fld, wt;
         if (!pb_read_tag(&p, end, &fld, &wt)) return;
         if (fld == 1) {
-            /* Repeated fixed32 -- can be packed (length-delim block of fixed32s)
-             * or unpacked (one tag per element). Handle both. */
-            if (wt == 5) {
-                uint32_t f;
-                if (!pb_read_fixed32(&p, end, &f)) return;
-                if (out->n_route < (int)(sizeof(out->route)/sizeof(out->route[0])))
-                    out->route[out->n_route++] = f;
+            if (wt == 0) {
+                /* Unpacked varint, one tag per element. */
+                uint64_t v;
+                if (!pb_read_varint(&p, end, &v)) return;
+                if (out->n_route < route_cap) out->route[out->n_route++] = (uint32_t)v;
             } else if (wt == 2) {
+                /* Packed varint block. */
                 const uint8_t *bp; size_t blen;
                 if (!pb_read_length(&p, end, &bp, &blen)) return;
-                while (bp + 4 <= buf + len &&
-                       out->n_route < (int)(sizeof(out->route)/sizeof(out->route[0])) &&
-                       blen >= 4) {
-                    uint32_t f = (uint32_t)bp[0] | ((uint32_t)bp[1] << 8) |
-                                 ((uint32_t)bp[2] << 16) | ((uint32_t)bp[3] << 24);
-                    out->route[out->n_route++] = f;
-                    bp += 4; blen -= 4;
+                const uint8_t *q = bp, *qend = bp + blen;
+                while (q < qend && out->n_route < route_cap) {
+                    uint64_t v;
+                    if (!pb_read_varint(&q, qend, &v)) break;
+                    out->route[out->n_route++] = (uint32_t)v;
                 }
             } else {
                 if (!pb_skip_value(&p, end, wt)) return;
@@ -283,17 +557,18 @@ bool mesh_decode_waypoint(const uint8_t *buf, size_t len, mesh_waypoint_t *out)
         const uint8_t *bp; size_t blen; uint64_t v;
         switch (fld) {
         case 1: if (!pb_read_varint(&p, end, &v)) return false; out->id = (uint32_t)v; break;
-        case 2: if (!pb_read_varint(&p, end, &v)) return false;
-                out->lat_deg = (double)pb_zigzag32((uint32_t)v) * 1e-7; out->have_lat = true; break;
-        case 3: if (!pb_read_varint(&p, end, &v)) return false;
-                out->lon_deg = (double)pb_zigzag32((uint32_t)v) * 1e-7; out->have_lon = true; break;
+        case 2: { uint32_t f; if (!pb_read_fixed32(&p, end, &f)) return false;
+                  out->lat_deg = (double)(int32_t)f * 1e-7; out->have_lat = true; break; }
+        case 3: { uint32_t f; if (!pb_read_fixed32(&p, end, &f)) return false;
+                  out->lon_deg = (double)(int32_t)f * 1e-7; out->have_lon = true; break; }
         case 4: if (!pb_read_varint(&p, end, &v)) return false; out->expire = (uint32_t)v; break;
         case 5: if (!pb_read_varint(&p, end, &v)) return false; out->locked_to = (uint32_t)v; break;
         case 6: if (!pb_read_length(&p, end, &bp, &blen)) return false;
                 copy_str(out->name, sizeof(out->name), bp, blen); break;
         case 7: if (!pb_read_length(&p, end, &bp, &blen)) return false;
                 copy_str(out->description, sizeof(out->description), bp, blen); break;
-        case 8: if (!pb_read_varint(&p, end, &v)) return false; out->icon = (uint32_t)v; break;
+        case 8: { uint32_t f; if (!pb_read_fixed32(&p, end, &f)) return false;
+                  out->icon = f; break; }
         default: if (!pb_skip_value(&p, end, wt)) return false; break;
         }
     }
@@ -312,7 +587,8 @@ static void parse_one_neighbor(const uint8_t *buf, size_t len, mesh_neighbor_t *
         case 1: if (!pb_read_varint(&p, end, &v)) return; n->node_id = (uint32_t)v; break;
         case 2: { uint32_t f; if (!pb_read_fixed32(&p, end, &f)) return;
                   n->snr_db = u32_as_float(f); break; }
-        case 3: if (!pb_read_varint(&p, end, &v)) return; n->last_rx_time = (uint32_t)v; break;
+        case 3: { uint32_t f; if (!pb_read_fixed32(&p, end, &f)) return;
+                  n->last_rx_time = f; break; }
         case 4: if (!pb_read_varint(&p, end, &v)) return; n->node_broadcast_interval_secs = (uint32_t)v; break;
         default: if (!pb_skip_value(&p, end, wt)) return; break;
         }
@@ -344,9 +620,9 @@ bool mesh_decode_neighborinfo(const uint8_t *buf, size_t len, mesh_neighborinfo_
 
 /* ---- KEY_VERIFICATION_APP -- subset of meshtastic.KeyVerification ----
  *
- * Only the metadata: nonce, remote_node_id, hash sizes. We do not
- * surface the hash bytes -- they could be used to fingerprint a
- * verification exchange, and the JSON feed crosses trust boundaries. */
+ * Only the metadata: nonce, hash sizes. We do not surface the hash
+ * bytes -- they could be used to fingerprint a verification exchange,
+ * and the JSON feed crosses trust boundaries. */
 bool mesh_decode_keyverif(const uint8_t *buf, size_t len, mesh_keyverif_t *out)
 {
     if (!buf || !out) return false;
@@ -360,11 +636,10 @@ bool mesh_decode_keyverif(const uint8_t *buf, size_t len, mesh_keyverif_t *out)
         case 1: if (!pb_read_varint(&p, end, &v)) return false; out->nonce = v; break;
         case 2: if (!pb_read_length(&p, end, &bp, &blen)) return false; out->hash1_len = (int)blen; break;
         case 3: if (!pb_read_length(&p, end, &bp, &blen)) return false; out->hash2_len = (int)blen; break;
-        case 4: if (!pb_read_varint(&p, end, &v)) return false; out->remote_node_id = (uint32_t)v; break;
         default: if (!pb_skip_value(&p, end, wt)) return false; break;
         }
     }
-    return out->nonce != 0 || out->remote_node_id != 0;
+    return out->nonce != 0 || out->hash1_len != 0 || out->hash2_len != 0;
 }
 
 /* ---- MAP_REPORT_APP -- meshtastic.MapReport ---- */
@@ -390,9 +665,9 @@ bool mesh_decode_mapreport(const uint8_t *buf, size_t len, mesh_mapreport_t *out
         case 7: if (!pb_read_varint(&p, end, &v)) return false; out->modem_preset = (uint32_t)v; break;
         case 8: if (!pb_read_varint(&p, end, &v)) return false; out->has_default_channel = (uint32_t)v; break;
         case 9: { uint32_t f; if (!pb_read_fixed32(&p, end, &f)) return false;
-                  out->lat_deg = (double)pb_zigzag32(f) * 1e-7; out->have_lat = true; break; }
+                  out->lat_deg = (double)(int32_t)f * 1e-7; out->have_lat = true; break; }
         case 10:{ uint32_t f; if (!pb_read_fixed32(&p, end, &f)) return false;
-                  out->lon_deg = (double)pb_zigzag32(f) * 1e-7; out->have_lon = true; break; }
+                  out->lon_deg = (double)(int32_t)f * 1e-7; out->have_lon = true; break; }
         case 11:if (!pb_read_varint(&p, end, &v)) return false; out->altitude_m = (int32_t)v; break;
         case 12:if (!pb_read_varint(&p, end, &v)) return false; out->position_precision = (uint32_t)v; break;
         case 13:if (!pb_read_varint(&p, end, &v)) return false; out->num_online_local_nodes = (uint32_t)v; break;
@@ -444,8 +719,8 @@ const char *mesh_atak_team_name(int team)
 const char *mesh_atak_role_name(int role)
 {
     static const char *names[] = {
-        "TeamMember","TeamLead","HQ","Sniper","Medic","ForwardObserver",
-        "RTO","K9"
+        "Unspecified","TeamMember","TeamLead","HQ","Sniper","Medic",
+        "ForwardObserver","RTO","K9"
     };
     if (role < 0 || role >= (int)(sizeof(names)/sizeof(names[0]))) return "Unknown";
     return names[role];
@@ -503,12 +778,12 @@ static void parse_pli(const uint8_t *buf, size_t len, mesh_atak_t *out)
         uint32_t fld, wt; uint64_t v;
         if (!pb_read_tag(&p, end, &fld, &wt)) return;
         switch (fld) {
-        case 1: if (!pb_read_varint(&p, end, &v)) return;
-                out->lat_deg = (double)pb_zigzag32((uint32_t)v) * 1e-7;
-                out->have_lat = true; break;
-        case 2: if (!pb_read_varint(&p, end, &v)) return;
-                out->lon_deg = (double)pb_zigzag32((uint32_t)v) * 1e-7;
-                out->have_lon = true; break;
+        case 1: { uint32_t f; if (!pb_read_fixed32(&p, end, &f)) return;
+                  out->lat_deg = (double)(int32_t)f * 1e-7;
+                  out->have_lat = true; break; }
+        case 2: { uint32_t f; if (!pb_read_fixed32(&p, end, &f)) return;
+                  out->lon_deg = (double)(int32_t)f * 1e-7;
+                  out->have_lon = true; break; }
         case 3: if (!pb_read_varint(&p, end, &v)) return;
                 out->altitude_hae_m = (int32_t)v; break;
         case 4: if (!pb_read_varint(&p, end, &v)) return;
@@ -527,7 +802,7 @@ static void parse_chat(const uint8_t *buf, size_t len, mesh_atak_t *out)
     while (p < end) {
         uint32_t fld, wt;
         if (!pb_read_tag(&p, end, &fld, &wt)) return;
-        const uint8_t *bp; size_t blen;
+        const uint8_t *bp; size_t blen; uint64_t v;
         switch (fld) {
         case 1: if (!pb_read_length(&p, end, &bp, &blen)) return;
                 copy_str(out->chat_message, sizeof(out->chat_message), bp, blen); break;
@@ -535,6 +810,16 @@ static void parse_chat(const uint8_t *buf, size_t len, mesh_atak_t *out)
                 copy_str(out->chat_to, sizeof(out->chat_to), bp, blen); break;
         case 3: if (!pb_read_length(&p, end, &bp, &blen)) return;
                 copy_str(out->chat_to_callsign, sizeof(out->chat_to_callsign), bp, blen); break;
+        case 4: if (!pb_read_length(&p, end, &bp, &blen)) return;
+                copy_str(out->chat_receipt_for_uid, sizeof(out->chat_receipt_for_uid), bp, blen); break;
+        case 5: if (!pb_read_varint(&p, end, &v)) return;
+                out->chat_receipt_type = (uint32_t)v; break;
+        case 6: if (!pb_read_length(&p, end, &bp, &blen)) return;
+                copy_str(out->chat_lang, sizeof(out->chat_lang), bp, blen); break;
+        case 7: if (!pb_read_length(&p, end, &bp, &blen)) return;
+                copy_str(out->chat_room_id, sizeof(out->chat_room_id), bp, blen); break;
+        case 8: if (!pb_read_length(&p, end, &bp, &blen)) return;
+                out->chat_has_voice_profile = true; (void)bp; (void)blen; break;
         default: if (!pb_skip_value(&p, end, wt)) return; break;
         }
     }
@@ -584,6 +869,53 @@ static void parse_packed_uint32(const uint8_t *bp, size_t blen,
     }
 }
 
+/* Accept both packed (wt=2, length-delimited block of varints) and
+ * unpacked (wt=0, one varint per repetition) encodings for a repeated
+ * scalar field. proto3 senders may emit either form for the same
+ * field, so a decoder that hard-codes wt=2 mis-reads unpacked frames. */
+static bool append_repeated_u32(const uint8_t **pp, const uint8_t *end,
+                                uint32_t wt, uint32_t *arr,
+                                int *arr_len, int cap)
+{
+    if (wt == 0) {
+        uint64_t v;
+        if (!pb_read_varint(pp, end, &v)) return false;
+        if (*arr_len < cap) arr[(*arr_len)++] = (uint32_t)v;
+        return true;
+    }
+    if (wt == 2) {
+        const uint8_t *bp; size_t blen;
+        if (!pb_read_length(pp, end, &bp, &blen)) return false;
+        parse_packed_uint32(bp, blen, arr, arr_len, cap);
+        return true;
+    }
+    return pb_skip_value(pp, end, wt);
+}
+
+static bool append_repeated_i8(const uint8_t **pp, const uint8_t *end,
+                               uint32_t wt, int8_t *arr,
+                               int *arr_len, int cap)
+{
+    if (wt == 0) {
+        uint64_t v;
+        if (!pb_read_varint(pp, end, &v)) return false;
+        if (*arr_len < cap) arr[(*arr_len)++] = (int8_t)(int32_t)v;
+        return true;
+    }
+    if (wt == 2) {
+        const uint8_t *bp; size_t blen;
+        if (!pb_read_length(pp, end, &bp, &blen)) return false;
+        const uint8_t *q = bp, *qend = bp + blen;
+        while (q < qend && *arr_len < cap) {
+            uint64_t v;
+            if (!pb_read_varint(&q, qend, &v)) break;
+            arr[(*arr_len)++] = (int8_t)(int32_t)v;
+        }
+        return true;
+    }
+    return pb_skip_value(pp, end, wt);
+}
+
 bool mesh_decode_traceroute(const uint8_t *buf, size_t len, mesh_traceroute_t *out)
 {
     if (!buf || !out) return false;
@@ -592,38 +924,19 @@ bool mesh_decode_traceroute(const uint8_t *buf, size_t len, mesh_traceroute_t *o
     while (p < end) {
         uint32_t fld, wt;
         if (!pb_read_tag(&p, end, &fld, &wt)) return false;
-        const uint8_t *bp; size_t blen;
+        bool ok;
         switch (fld) {
-        case 1: if (!pb_read_length(&p, end, &bp, &blen)) return false;
-                parse_packed_uint32(bp, blen, out->route, &out->route_len, 16); break;
-        case 2: if (!pb_read_length(&p, end, &bp, &blen)) return false;
-                {
-                    int i = 0;
-                    const uint8_t *q = bp, *qend = bp + blen;
-                    while (q < qend && i < 16) {
-                        uint64_t v;
-                        if (!pb_read_varint(&q, qend, &v)) break;
-                        out->snr_towards[i++] = (int8_t)pb_zigzag32((uint32_t)v);
-                    }
-                    out->snr_towards_len = i;
-                }
-                break;
-        case 3: if (!pb_read_length(&p, end, &bp, &blen)) return false;
-                parse_packed_uint32(bp, blen, out->route_back, &out->route_back_len, 16); break;
-        case 4: if (!pb_read_length(&p, end, &bp, &blen)) return false;
-                {
-                    int i = 0;
-                    const uint8_t *q = bp, *qend = bp + blen;
-                    while (q < qend && i < 16) {
-                        uint64_t v;
-                        if (!pb_read_varint(&q, qend, &v)) break;
-                        out->snr_back[i++] = (int8_t)pb_zigzag32((uint32_t)v);
-                    }
-                    out->snr_back_len = i;
-                }
-                break;
-        default: if (!pb_skip_value(&p, end, wt)) return false; break;
+        case 1: ok = append_repeated_u32(&p, end, wt,
+                                         out->route, &out->route_len, 16); break;
+        case 2: ok = append_repeated_i8(&p, end, wt,
+                                        out->snr_towards, &out->snr_towards_len, 16); break;
+        case 3: ok = append_repeated_u32(&p, end, wt,
+                                         out->route_back, &out->route_back_len, 16); break;
+        case 4: ok = append_repeated_i8(&p, end, wt,
+                                        out->snr_back, &out->snr_back_len, 16); break;
+        default: ok = pb_skip_value(&p, end, wt); break;
         }
+        if (!ok) return false;
     }
     return out->route_len > 0 || out->route_back_len > 0;
 }
@@ -634,7 +947,6 @@ bool mesh_decode_traceroute(const uint8_t *buf, size_t len, mesh_traceroute_t *o
  *   1 type           (varint, enum)
  *   2 gpio_mask      (varint uint64)
  *   3 gpio_value     (varint uint64)
- *   4 txid           (varint uint32)
  */
 bool mesh_decode_remote_hw(const uint8_t *buf, size_t len, mesh_remote_hw_t *out)
 {
@@ -649,7 +961,6 @@ bool mesh_decode_remote_hw(const uint8_t *buf, size_t len, mesh_remote_hw_t *out
         case 1: if (!pb_read_varint(&p, end, &v)) return false; out->type = (uint32_t)v; break;
         case 2: if (!pb_read_varint(&p, end, &v)) return false; out->gpio_mask = v; break;
         case 3: if (!pb_read_varint(&p, end, &v)) return false; out->gpio_value = v; break;
-        case 4: if (!pb_read_varint(&p, end, &v)) return false; out->txid = (uint32_t)v; break;
         default: if (!pb_skip_value(&p, end, wt)) return false; break;
         }
     }
@@ -764,14 +1075,13 @@ const char *mesh_storeforward_rr_name(uint32_t rr)
     case 5:   return "ROUTER_BUSY";
     case 6:   return "ROUTER_HISTORY";
     case 7:   return "ROUTER_STATS";
-    case 8:   return "ROUTER_TEXT_BROADCAST";
-    case 9:   return "ROUTER_TEXT_DIRECT";
+    case 8:   return "ROUTER_TEXT_DIRECT";
+    case 9:   return "ROUTER_TEXT_BROADCAST";
     case 64:  return "CLIENT_ERROR";
     case 65:  return "CLIENT_HISTORY";
     case 66:  return "CLIENT_STATS";
     case 67:  return "CLIENT_PING";
     case 68:  return "CLIENT_PONG";
-    case 69:  return "CLIENT_TEXT";
     case 106: return "CLIENT_ABORT";
     default:  return NULL;
     }

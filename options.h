@@ -61,6 +61,36 @@ extern op_mode_t     opt_op_mode;
 extern bool          opt_alert_off_grid;
 extern bool          opt_list_devices;
 extern bool          opt_print_schema;
+extern bool          opt_trusted_only;
+extern bool          opt_show_untrusted;
+extern bool          opt_diagnostics;
+
+/* Deep-decode mode -- toggles the scan-then-focus pool. OFF keeps the
+ * wideband-only path byte-identical to the pre-Phase-3 baseline; AUTO
+ * provisions an IQ ring and a focused-worker pool that rewind and
+ * deep-decode wideband-detected slots. */
+typedef enum {
+    DEEP_DECODE_OFF = 0,
+    DEEP_DECODE_AUTO = 1,
+} deep_decode_mode_t;
+extern deep_decode_mode_t opt_deep_decode;
+extern int           opt_focus_workers;       /* 1..4 */
+extern double        opt_focus_hold_s;        /* hysteresis seconds */
+extern int           opt_focus_rewind_ms;     /* rewind from "now" on promotion */
+extern int           opt_focus_ring_ms;       /* raw-IQ ring history */
+extern char         *opt_focus_freqs_csv;     /* optional allowlist Hz,Hz,... */
+extern double        opt_focus_min_snr_db;    /* drop pool promotions below this SNR */
+extern int           opt_focus_os;            /* 0=auto, otherwise 1/2/4/8 */
+
+/* TDOA snapshot-store: per-event raw-IQ capture from the iq_ring.
+ * Disabled when opt_snapshot_store_dir is NULL. min_snr_db < 0 means
+ * "inherit from opt_focus_min_snr_db at startup". */
+extern char         *opt_snapshot_store_dir;
+extern int           opt_snapshot_window_pre_ms;
+extern int           opt_snapshot_window_post_ms;
+extern long long     opt_snapshot_disk_mb;
+extern long long     opt_snapshot_age_s;
+extern double        opt_snapshot_min_snr_db;
 
 /* Meshtastic */
 extern char         *opt_region;          /* "US", "EU_868", ... */
@@ -70,6 +100,17 @@ extern char         *opt_keys_file;       /* path; one spec per line, # comments
 extern char         *opt_share_url;       /* meshtastic.org/e/ URL to import at startup */
 extern char         *opt_iq_record;       /* path to write raw IQ to (tee from push_samples) */
 extern char         *opt_stats_json;      /* path to dump 5s per-channel stats JSON */
+/* FFTW wisdom persistence. NULL = disabled. Empty string "" = use the
+ * default XDG cache path. Non-empty = use the explicit path. */
+extern char         *opt_fftw_wisdom;
+
+/* Webhook sink. NULL url = disabled. event_csv NULL/empty uses the
+ * default allowlist (PSK_DISCOVERED, OFF_GRID_LORA, GEOFENCE_*).
+ * format selects the wire shape: "raw" (default), "slack", "discord". */
+extern char         *opt_webhook_url;
+extern char         *opt_webhook_on;
+extern char         *opt_webhook_format;
+extern int           opt_webhook_timeout_ms;
 
 /* Extra user-supplied off-grid slots (e.g. promoted from scan). */
 #define EXTRA_FREQ_MAX 32
@@ -85,6 +126,7 @@ extern int          opt_extra_freq_count;
 /* SDR / file input */
 extern char       *opt_input_file;       /* IQ file path for FILE backend */
 extern iq_format_t iq_format;            /* FMT_CI8 / FMT_CI16 / FMT_CF32 */
+extern bool        opt_iq_format_set;    /* true if --iq-format given on CLI */
 
 /* Per-backend gain controls */
 extern int  hackrf_lna_gain;             /* 0..40 step 8 */
@@ -124,6 +166,11 @@ extern char *opt_mqtt_topic;
 extern char *opt_zmq_endpoint;
 extern char *opt_cot_multicast;          /* "239.2.3.1:6969" or NULL */
 extern int   opt_web_port;
+/* Live wideband spectrum waterfall on the dashboard. Default off so a
+ * stock --web run pays no CPU or bandwidth for it; when set, the
+ * sensor enables (or reuses) the scanner and publishes WATERFALL SSE
+ * events the Spectrum tab renders into a scrolling canvas. */
+extern int   opt_web_waterfall;
 extern char *opt_station_id;
 extern char *opt_gpsd_endpoint;          /* "host:port"; NULL = disabled */
 extern char *opt_api_token;              /* bearer token for POST /api endpoints; NULL = unauthenticated */

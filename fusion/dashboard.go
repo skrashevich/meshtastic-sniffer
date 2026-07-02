@@ -18,87 +18,287 @@ const dashboardHTML = `<!doctype html>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
+/* Design tokens. Single source of truth for colors, type, spacing, radii.
+ * Every rule below uses var(--token) instead of hardcoded values so the
+ * dashboard has one place to retune visual language. Conventions:
+ *
+ *   Headings:
+ *     h2 = section header inside a padded tab (e.g. Sensors "Add sensor")
+ *     h3 = pane title in a grid pane (Live / Evidence)
+ *     h4 = subsection inside a pane (Evidence detail)
+ *
+ *   Buttons:
+ *     button.primary  -- safe affirmative actions (Add, Apply)
+ *     button.danger   -- destructive (Remove)
+ *     #tabs button    -- nav-style tab buttons (no chrome)
+ *
+ *   Status colors are reserved for actual status:
+ *     --ok    green   converged / healthy
+ *     --warn  amber   degraded / stale
+ *     --err   red     not ready / rejected / placement bad
+ *     --stale purple  previously converged, now too old
+ *
+ *   Monospace (--font-mono) is reserved for IDs, timestamps, and numeric
+ *   tabular values -- not body text. */
+:root {
+  /* surfaces */
+  --bg: #0f172a;
+  --bg-panel: #1e293b;
+  --bg-selected: #0c4a6e;
+  --border: #334155;
+  --border-soft: #1e293b;
+
+  /* text (darkest to brightest) */
+  --text-muted: #64748b;
+  --text-3: #94a3b8;
+  --text-2: #cbd5e1;
+  --text: #e2e8f0;
+  --text-bright: #f8fafc;
+
+  /* accent (cyan family) */
+  --accent: #38bdf8;
+  --accent-deep: #0284c7;
+  --accent-pale: #bae6fd;
+  --accent-bg: #0c4a6e;
+  --accent-hover: #075985;
+
+  /* status */
+  --ok: #22c55e;
+  --ok-bright: #4ade80;
+  --warn: #f59e0b;
+  --warn-bright: #fbbf24;
+  --warn-deep: #fb923c;
+  --err: #ef4444;
+  --err-bright: #f87171;
+  --stale: #a78bfa;
+
+  /* error surface (loud banners) */
+  --err-bg: #7f1d1d;
+  --err-border: #b91c1c;
+  --err-text: #fecaca;
+  --err-hover: #991b1b;
+
+  /* type scale (ascending) */
+  --text-xs: 10px;
+  --text-sm: 11px;
+  --text-base: 12px;
+  --text-md: 13px;
+  --text-body: 14px;  /* root <body> default; rarely set on individual rules */
+  --text-lg: 15px;
+
+  /* spacing */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+
+  /* radius */
+  --radius-sm: 2px;
+  --radius: 3px;
+  --radius-lg: 5px;
+
+  /* fonts */
+  --font-mono: 'SF Mono', Consolas, monospace;
+}
+
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:system-ui,-apple-system,sans-serif;background:#0f172a;color:#e2e8f0;
-  height:100vh;display:flex;flex-direction:column;font-size:14px}
-#bar{height:44px;flex-shrink:0;background:#1e293b;display:flex;align-items:center;
-  padding:0 16px;gap:20px;border-bottom:1px solid #334155}
-#bar .title{font-weight:600;color:#f8fafc;letter-spacing:0.5px}
-#bar .stat{color:#94a3b8;font-size:13px}
-#bar .val{color:#38bdf8;font-weight:600;font-variant-numeric:tabular-nums;margin-left:6px}
-#bar #status{margin-left:auto;color:#64748b;font-size:12px}
-#tabs{display:flex;align-items:center;background:#1e293b;border-bottom:1px solid #334155;
+body{font-family:system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);
+  height:100vh;display:flex;flex-direction:column;font-size:var(--text-body)}
+#bar{height:44px;flex-shrink:0;background:var(--bg-panel);display:flex;align-items:center;
+  padding:0 var(--space-4);gap:var(--space-5);border-bottom:1px solid var(--border)}
+#bar .title{font-weight:600;color:var(--text-bright);letter-spacing:0.5px}
+#bar .stat{color:var(--text-3);font-size:var(--text-md)}
+#bar .val{color:var(--accent);font-weight:600;font-variant-numeric:tabular-nums;margin-left:6px}
+#bar #status{margin-left:auto;color:var(--text-muted);font-size:var(--text-base)}
+#tabs{display:flex;align-items:center;background:var(--bg-panel);border-bottom:1px solid var(--border);
   flex-shrink:0}
-#tabs button{background:none;color:#64748b;border:none;padding:8px 16px;cursor:pointer;
-  font:inherit;text-transform:uppercase;font-size:12px;letter-spacing:1px;font-weight:600;
-  border-bottom:2px solid transparent}
-#tabs button:hover{color:#94a3b8}
-#tabs button.active{color:#38bdf8;border-bottom-color:#38bdf8}
-.tab{flex:1;display:none;overflow:auto;padding:18px}
+#tabs button{background:none;color:var(--text-muted);border:none;padding:var(--space-2) var(--space-4);
+  cursor:pointer;font:inherit;text-transform:uppercase;font-size:var(--text-base);letter-spacing:1px;
+  font-weight:600;border-bottom:2px solid transparent}
+#tabs button:hover{color:var(--text-3)}
+#tabs button.active{color:var(--accent);border-bottom-color:var(--accent)}
+.tab{flex:1;display:none;overflow:auto;padding:var(--space-4)}
 .tab.active{display:block}
 #live.tab{padding:0}
 #live.tab.active{display:flex}
 #live-grid{display:grid;grid-template-columns:2fr 1fr;grid-template-rows:1fr 1fr 1fr;
-  height:100%;width:100%;gap:1px;background:#334155}
+  height:100%;width:100%;gap:1px;background:var(--border)}
 #live-map-pane{grid-row:span 3;padding:0}
 #live-map{width:100%;height:100%}
-.leaflet-container{background:#0f172a}
-.live-pane{padding:8px 10px;overflow:auto;background:#0f172a}
-.live-pane h3{font-size:11px;color:#38bdf8;text-transform:uppercase;letter-spacing:1px;
-  margin-bottom:6px;border-bottom:1px solid #334155;padding-bottom:4px}
-h2{font-size:12px;color:#38bdf8;text-transform:uppercase;letter-spacing:1px;font-weight:600;
-  border-bottom:1px solid #334155;padding-bottom:5px;margin-bottom:10px}
-table{width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:tabular-nums}
-th,td{text-align:left;padding:5px 8px;border-bottom:1px solid #1e293b}
-th{color:#64748b;font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:0.5px}
-tr:hover td{background:#1e293b}
-.muted{color:#64748b}
-.status-ok{color:#4ade80}
-.status-err{color:#f87171}
-.status-stale{color:#fbbf24}
-.row{margin-bottom:14px;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-input[type=text],textarea{background:#0f172a;color:#e2e8f0;border:1px solid #334155;
-  border-radius:3px;padding:6px 10px;font:inherit;font-size:13px;flex:1;min-width:200px}
-input[type=text]:focus,textarea:focus{outline:none;border-color:#38bdf8}
-textarea{font-family:'SF Mono',Consolas,monospace;min-height:80px}
-button.primary{background:#0c4a6e;color:#bae6fd;border:1px solid #0284c7;border-radius:3px;
-  padding:6px 14px;cursor:pointer;font-size:13px;font-weight:500}
-button.primary:hover{background:#075985}
-button.danger{background:#7f1d1d;color:#fecaca;border:1px solid #b91c1c;border-radius:3px;
-  padding:3px 9px;cursor:pointer;font-size:11px}
-button.danger:hover{background:#991b1b}
-.hint{color:#64748b;font-size:11px;margin-top:4px;display:block}
-.placeholder{color:#64748b;font-style:italic;padding:30px 0;text-align:center}
+.leaflet-container{background:var(--bg)}
+.live-pane{padding:var(--space-2) 10px;overflow:auto;background:var(--bg)}
+.live-pane h3{font-size:var(--text-sm);color:var(--accent);text-transform:uppercase;letter-spacing:1px;
+  margin-bottom:6px;border-bottom:1px solid var(--border);padding-bottom:var(--space-1)}
+h2{font-size:var(--text-base);color:var(--accent);text-transform:uppercase;letter-spacing:1px;font-weight:600;
+  border-bottom:1px solid var(--border);padding-bottom:5px;margin-bottom:10px}
+table{width:100%;border-collapse:collapse;font-size:var(--text-base);font-variant-numeric:tabular-nums}
+th,td{text-align:left;padding:5px var(--space-2);border-bottom:1px solid var(--border-soft)}
+th{color:var(--text-muted);font-weight:600;font-size:var(--text-sm);text-transform:uppercase;letter-spacing:0.5px}
+tr:hover td{background:var(--bg-panel)}
+.muted{color:var(--text-muted)}
+.status-ok{color:var(--ok-bright)}
+.status-err{color:var(--err-bright)}
+.status-stale{color:var(--warn-bright)}
+.row{margin-bottom:14px;display:flex;gap:var(--space-2);flex-wrap:wrap;align-items:center}
+input[type=text],textarea{background:var(--bg);color:var(--text);border:1px solid var(--border);
+  border-radius:var(--radius);padding:6px 10px;font:inherit;font-size:var(--text-md);flex:1;min-width:200px}
+input[type=text]:focus,textarea:focus{outline:none;border-color:var(--accent)}
+textarea{font-family:var(--font-mono);min-height:80px}
+button.primary{background:var(--accent-bg);color:var(--accent-pale);border:1px solid var(--accent-deep);
+  border-radius:var(--radius);padding:6px 14px;cursor:pointer;font-size:var(--text-md);font-weight:500}
+button.primary:hover{background:var(--accent-hover)}
+button.danger{background:var(--err-bg);color:var(--err-text);border:1px solid var(--err-border);
+  border-radius:var(--radius);padding:3px 9px;cursor:pointer;font-size:var(--text-sm)}
+button.danger:hover{background:var(--err-hover)}
+.hint{color:var(--text-muted);font-size:var(--text-sm);margin-top:var(--space-1);display:block}
+.placeholder{color:var(--text-muted);font-style:italic;padding:30px 0;text-align:center}
 #activity-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:10px}
-.preset-card{background:#1e293b;border:1px solid #334155;border-radius:5px;padding:12px 14px;
-  display:flex;flex-direction:column;gap:6px}
-.preset-card.hot{border-color:#38bdf8}
+.preset-card{background:var(--bg-panel);border:1px solid var(--border);border-radius:var(--radius-lg);
+  padding:var(--space-3) 14px;display:flex;flex-direction:column;gap:6px}
+.preset-card.hot{border-color:var(--accent)}
 .preset-card.dead{opacity:0.55}
-.preset-card .top{display:flex;align-items:baseline;gap:8px}
-.preset-card .nm{font-size:15px;font-weight:600;color:#f8fafc;flex:1}
-.preset-card .meta{color:#94a3b8;font-size:11px}
-.preset-card .row2{display:flex;gap:14px;font-size:12px;margin-top:2px}
-.preset-card .lbl{color:#64748b;font-size:10px;text-transform:uppercase;letter-spacing:0.5px;display:block}
-.preset-card .v{color:#38bdf8;font-weight:600;font-size:15px;font-variant-numeric:tabular-nums}
-.preset-card .station-list{display:flex;flex-direction:column;gap:3px;margin-top:4px}
-.preset-card .station-row{display:flex;justify-content:space-between;font-size:12px;
-  background:#0f172a;border-radius:3px;padding:3px 7px;color:#cbd5e1}
-.preset-card .station-row .dot{display:inline-block;width:8px;height:8px;border-radius:50%;
-  margin-right:6px;vertical-align:middle}
+.preset-card .top{display:flex;align-items:baseline;gap:var(--space-2)}
+.preset-card .nm{font-size:var(--text-lg);font-weight:600;color:var(--text-bright);flex:1}
+.preset-card .meta{color:var(--text-3);font-size:var(--text-sm)}
+.preset-card .row2{display:flex;gap:14px;font-size:var(--text-base);margin-top:2px}
+.preset-card .lbl{color:var(--text-muted);font-size:var(--text-xs);text-transform:uppercase;
+  letter-spacing:0.5px;display:block}
+.preset-card .v{color:var(--accent);font-weight:600;font-size:var(--text-lg);font-variant-numeric:tabular-nums}
+.preset-card .station-list{display:flex;flex-direction:column;gap:3px;margin-top:var(--space-1)}
+.preset-card .station-row{display:flex;justify-content:space-between;font-size:var(--text-base);
+  background:var(--bg);border-radius:var(--radius);padding:3px 7px;color:var(--text-2)}
+.preset-card .station-row .dot{display:inline-block;width:var(--space-2);height:var(--space-2);
+  border-radius:50%;margin-right:6px;vertical-align:middle}
 #topology.tab.active{display:flex;flex-direction:column;position:relative;padding:0}
-#topo-canvas{flex:1;display:block;width:100%;background:#0f172a;cursor:default}
+#topo-canvas{flex:1;display:block;width:100%;background:var(--bg);cursor:default}
 #topo-canvas.hovering{cursor:pointer}
 #topo-empty{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);
   pointer-events:none;z-index:5;max-width:480px;text-align:center}
-#topo-legend{position:absolute;left:10px;top:10px;color:#64748b;font-size:11px;
-  background:rgba(15,23,42,0.85);padding:7px 11px;border-radius:3px;border:1px solid #334155;z-index:4;pointer-events:none}
-#topo-legend .l-station,#topo-legend .l-node{display:inline-block;width:8px;height:8px;
+#topo-legend{position:absolute;left:10px;top:10px;color:var(--text-muted);font-size:var(--text-sm);
+  background:rgba(15,23,42,0.85);padding:7px 11px;border-radius:var(--radius);
+  border:1px solid var(--border);z-index:4;pointer-events:none}
+#topo-legend .l-station,#topo-legend .l-node{display:inline-block;width:var(--space-2);height:var(--space-2);
   border-radius:50%;vertical-align:middle;margin-right:3px}
-#topo-legend .l-station{background:#fbbf24;border:1px solid #f59e0b}
-#topo-legend .l-node{background:#38bdf8}
-.fanout-result{font-family:'SF Mono',Consolas,monospace;font-size:11px;color:#94a3b8;
-  background:#1e293b;border-radius:3px;padding:8px 10px;margin-top:6px;white-space:pre-wrap;
-  max-height:200px;overflow:auto}
+#topo-legend .l-station{background:var(--warn-bright);border:1px solid var(--warn)}
+#topo-legend .l-node{background:var(--accent)}
+.fanout-result{font-family:var(--font-mono);font-size:var(--text-sm);color:var(--text-3);
+  background:var(--bg-panel);border-radius:var(--radius);padding:var(--space-2) 10px;
+  margin-top:6px;white-space:pre-wrap;max-height:200px;overflow:auto}
+
+/* Evidence tab. Mirrors the Live tab's "map left, panes stacked right"
+ * grid so the operator's eye lands on geography first and the timeline
+ * + detail act as side panes. Top header holds the health strip and
+ * persistent warnings full-width above the work area. */
+#evidence.tab{padding:0;display:none;flex-direction:column}
+#evidence.tab.active{display:flex}
+#ev-header{flex:none;padding:10px 14px 6px;border-bottom:1px solid var(--border)}
+#ev-health-strip{display:flex;gap:10px;flex-wrap:wrap}
+.ev-card{background:var(--bg-panel);border:1px solid var(--border);border-radius:var(--radius);
+  padding:6px 10px;min-width:108px}
+.ev-card .ev-label{color:var(--text-muted);text-transform:uppercase;font-size:var(--text-xs);
+  letter-spacing:0.06em;font-weight:600;margin-bottom:2px}
+.ev-card .ev-value{font-size:var(--text-lg);font-variant-numeric:tabular-nums;font-weight:600;
+  color:var(--text);line-height:1.2}
+.ev-card .ev-sub{color:var(--text-3);font-size:var(--text-xs);margin-top:2px}
+.ev-state-ready{color:var(--ok)}
+.ev-state-degraded{color:var(--warn)}
+.ev-state-not_ready,.ev-state-no_anchor{color:var(--err)}
+.ev-state-stale{color:var(--stale)}
+#ev-warnings{margin-top:6px}
+#ev-persisted-banner{color:var(--text-3);font-size:var(--text-base);margin-top:6px}
+.ev-warn{background:var(--err-bg);color:var(--err-text);border:1px solid var(--err-border);
+  border-radius:var(--radius);padding:6px 10px;margin-top:var(--space-1);font-size:var(--text-sm);
+  line-height:1.4}
+.ev-warn b{color:#fff}
+#evidence-grid{flex:1;display:grid;grid-template-columns:2fr 1fr;grid-template-rows:1fr 1fr;
+  gap:1px;background:var(--border);min-height:0}
+#ev-map-pane{grid-row:span 2;position:relative;background:var(--bg);min-width:0;min-height:0}
+#ev-map{position:absolute;inset:0}
+#ev-map-empty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+  color:var(--text-muted);font-size:var(--text-base);pointer-events:none;background:var(--bg);z-index:400;
+  text-align:center;padding:20px}
+.ev-pane{background:var(--bg);display:flex;flex-direction:column;overflow:hidden;min-width:0;min-height:0}
+.ev-pane > h3{font-size:var(--text-sm);color:var(--accent);text-transform:uppercase;letter-spacing:1px;
+  margin:0;padding:var(--space-2) var(--space-3) var(--space-1);border-bottom:1px solid var(--border);
+  display:flex;align-items:center;justify-content:space-between;gap:var(--space-2);flex:none;font-weight:600}
+.ev-pane-controls{display:flex;align-items:center;gap:var(--space-2)}
+.ev-pane-controls .zoom-buttons{display:inline-flex;background:var(--bg-panel);
+  border:1px solid var(--border);border-radius:var(--radius);overflow:hidden}
+.ev-pane-controls .zoom-buttons button{background:transparent;color:var(--text-muted);border:none;
+  padding:3px var(--space-2);font-size:var(--text-xs);cursor:pointer;border-right:1px solid var(--border);
+  text-transform:none;letter-spacing:0;font-weight:400}
+.ev-pane-controls .zoom-buttons button:last-child{border-right:none}
+.ev-pane-controls .zoom-buttons button:hover{color:var(--text-3)}
+.ev-pane-controls .zoom-buttons button.active{background:var(--bg);color:var(--accent)}
+.ev-pane-controls .ev-readout{color:var(--text-muted);font-size:var(--text-xs);
+  font-variant-numeric:tabular-nums;text-transform:none;letter-spacing:0;font-weight:400}
+.ev-pane-controls .ev-refresh{background:transparent;border:1px solid var(--border);color:var(--text-3);
+  padding:3px var(--space-2);border-radius:var(--radius);cursor:pointer;font-size:var(--text-xs);
+  text-transform:none;letter-spacing:0;font-weight:400}
+.ev-pane-controls .ev-refresh:hover{color:var(--text)}
+#ev-timeline{flex:1;overflow-y:auto;padding:2px 0;min-height:0}
+#ev-timeline .ev-empty{color:var(--text-muted);padding:20px 14px;text-align:center;
+  font-size:var(--text-sm);line-height:1.5}
+.ev-row{display:grid;grid-template-columns:72px auto auto 80px 1fr auto;gap:var(--space-2);
+  padding:6px var(--space-3);border-bottom:1px solid var(--border-soft);cursor:pointer;
+  font-size:var(--text-sm);align-items:center;line-height:1.3}
+.ev-row .ev-action{background:transparent;border:1px solid var(--border);color:var(--text-3);
+  padding:2px 7px;border-radius:var(--radius);font-size:var(--text-xs);cursor:pointer;
+  font-family:inherit;text-transform:none;letter-spacing:0;font-weight:400;white-space:nowrap}
+.ev-row .ev-action:hover{color:var(--accent);border-color:var(--accent)}
+.ev-row .ev-action[disabled]{opacity:0.5;cursor:wait}
+.ev-row .ev-action.replayed{color:var(--ok);border-color:var(--ok)}
+.ev-row .ev-action.danger{color:var(--warn);border-color:var(--warn)}
+.ev-row .ev-action.danger:hover{color:var(--warn-bright);border-color:var(--warn-bright)}
+.ev-row .ev-action.danger.replayed{color:var(--stale);border-color:var(--stale)}
+.ev-row-actions{display:flex;gap:4px;align-items:center}
+.ev-row .ev-replay-tag{color:var(--ok);font-size:var(--text-xs);font-weight:600;
+  text-transform:uppercase;letter-spacing:0.05em;margin-left:6px}
+.ev-row .ev-replay-tag.current-model{color:var(--stale)}
+.ev-advanced-toggle{background:transparent;border:1px solid var(--border);color:var(--text-muted);
+  padding:3px var(--space-2);border-radius:var(--radius);cursor:pointer;font-size:var(--text-xs);
+  text-transform:none;letter-spacing:0;font-weight:400}
+.ev-advanced-toggle.on{color:var(--warn);border-color:var(--warn)}
+.ev-advanced-toggle:hover{color:var(--text-3)}
+.ev-row:hover{background:var(--bg-panel)}
+.ev-row.selected{background:var(--bg-selected);border-left:3px solid var(--accent);padding-left:9px}
+.ev-row .ev-time{color:var(--text-3);font-variant-numeric:tabular-nums;font-size:var(--text-xs)}
+.ev-row .ev-kind{font-size:var(--text-xs);text-transform:uppercase;letter-spacing:0.05em;
+  font-weight:600;padding:2px 5px;border-radius:var(--radius-sm);text-align:center;white-space:nowrap}
+.ev-row .ev-kind-anchor{background:#1d4ed8;color:#dbeafe}
+.ev-row .ev-kind-target{background:var(--bg-panel);color:var(--text-3);border:1px solid var(--border)}
+.ev-row .ev-kind-solved{background:#166534;color:#dcfce7}
+.ev-row .ev-kind-degraded{background:#854d0e;color:#fef3c7}
+.ev-row .ev-from{color:var(--text);font-family:var(--font-mono);font-size:var(--text-xs);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ev-row .ev-trust{font-size:var(--text-xs);text-align:left;text-transform:uppercase;letter-spacing:0.04em;
+  font-weight:600;white-space:nowrap}
+.ev-row .ev-summary{color:var(--text-3);font-size:var(--text-xs);overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap}
+.ev-trust-sample{color:var(--ok)}
+.ev-trust-sync{color:var(--accent)}
+.ev-trust-software_lock{color:var(--warn)}
+.ev-trust-frame{color:var(--warn-deep)}
+.ev-trust-degraded{color:var(--err)}
+#ev-detail{flex:1;overflow-y:auto;padding:10px var(--space-3);font-size:var(--text-sm);color:var(--text-2)}
+#ev-detail .ev-empty{color:var(--text-muted);text-align:center;padding-top:30px;
+  font-size:var(--text-sm);line-height:1.5}
+#ev-detail h4{margin:10px 0 var(--space-1) 0;font-size:var(--text-xs);text-transform:uppercase;
+  letter-spacing:0.06em;color:var(--text-muted);font-weight:600}
+#ev-detail h4:first-child{margin-top:0}
+#ev-detail .kv{display:flex;justify-content:space-between;padding:2px 0;
+  border-bottom:1px dotted var(--border-soft);gap:var(--space-2)}
+#ev-detail .kv .k{color:var(--text-muted);font-size:var(--text-xs);white-space:nowrap}
+#ev-detail .kv .v{color:var(--text);font-size:var(--text-sm);font-variant-numeric:tabular-nums;
+  font-family:var(--font-mono);text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#ev-detail table.ev-stations{width:100%;border-collapse:collapse;margin-top:var(--space-1);
+  font-size:var(--text-xs)}
+#ev-detail table.ev-stations th{color:var(--text-muted);text-transform:uppercase;
+  font-size:var(--text-xs);letter-spacing:0.05em;text-align:left;padding:3px 5px;
+  border-bottom:1px solid var(--border)}
+#ev-detail table.ev-stations td{color:var(--text-2);padding:3px 5px;
+  border-bottom:1px dotted var(--border-soft);font-family:var(--font-mono);font-size:var(--text-xs)}
 </style></head><body>
 <div id="bar">
   <span class="title">meshtastic-fusion</span>
@@ -110,6 +310,7 @@ button.danger:hover{background:#991b1b}
 <div id="tabs">
   <button id="tab-live" class="active" onclick="showTab('live')">Live</button>
   <button id="tab-activity" onclick="showTab('activity')">Activity</button>
+  <button id="tab-evidence" onclick="showTab('evidence')">Evidence</button>
   <button id="tab-topology" onclick="showTab('topology')">Topology</button>
   <button id="tab-sensors" onclick="showTab('sensors')">Sensors</button>
   <button id="tab-config" onclick="showTab('config')">Config</button>
@@ -135,6 +336,74 @@ button.danger:hover{background:#991b1b}
 
 <div id="activity" class="tab">
   <div id="activity-grid"></div>
+</div>
+
+<div id="evidence" class="tab">
+  <div id="ev-header">
+    <div id="ev-health-strip">
+      <div class="ev-card">
+        <div class="ev-label">TDOA</div>
+        <div class="ev-value" id="ev-tdoa-state">--</div>
+        <div class="ev-sub" id="ev-tdoa-sub">checking</div>
+      </div>
+      <div class="ev-card">
+        <div class="ev-label">Sensors</div>
+        <div class="ev-value" id="ev-sensors-count">0</div>
+        <div class="ev-sub" id="ev-sensors-sub">alive</div>
+      </div>
+      <div class="ev-card">
+        <div class="ev-label">Anchors</div>
+        <div class="ev-value" id="ev-anchors-count">0</div>
+        <div class="ev-sub" id="ev-anchors-sub">declared</div>
+      </div>
+      <div class="ev-card">
+        <div class="ev-label">Clock Pairs</div>
+        <div class="ev-value" id="ev-pairs-count">0</div>
+        <div class="ev-sub" id="ev-pairs-sub">converged</div>
+      </div>
+      <div class="ev-card">
+        <div class="ev-label">DB Rows</div>
+        <div class="ev-value" id="ev-db-clusters">0</div>
+        <div class="ev-sub" id="ev-db-sub">clusters / 0 fixes</div>
+      </div>
+      <div class="ev-card">
+        <div class="ev-label">Schema</div>
+        <div class="ev-value" id="ev-schema">--</div>
+        <div class="ev-sub" id="ev-schema-sub">replay disabled</div>
+      </div>
+    </div>
+    <div id="ev-persisted-banner" style="display:none"></div>
+    <div id="ev-warnings"></div>
+  </div>
+  <div id="evidence-grid">
+    <div id="ev-map-pane">
+      <div id="ev-map"></div>
+      <div id="ev-map-empty">No solved fixes in this window.<br>Solved emitter positions plot here as TDOA solves arrive.</div>
+    </div>
+    <div class="ev-pane" id="ev-timeline-pane">
+      <h3>
+        <span>Timeline</span>
+        <span class="ev-pane-controls">
+          <div class="zoom-buttons" id="ev-zoom">
+            <button data-zoom="15m">15m</button>
+            <button data-zoom="1h" class="active">1h</button>
+            <button data-zoom="6h">6h</button>
+            <button data-zoom="24h">24h</button>
+          </div>
+          <span class="ev-readout" id="ev-range-readout">last 1h</span>
+          <button class="ev-advanced-toggle" id="ev-advanced-btn"
+            onclick="evidenceToggleAdvanced()"
+            title="Show experimental current-model replay buttons">Advanced</button>
+          <button class="ev-refresh" onclick="evidenceRefresh()">↻</button>
+        </span>
+      </h3>
+      <div id="ev-timeline"><div class="ev-empty">Loading…</div></div>
+    </div>
+    <div class="ev-pane" id="ev-detail-pane">
+      <h3>Detail</h3>
+      <div id="ev-detail"><div class="ev-empty">Click a timeline row to see per-event detail: station participation, clock-sync snapshot, solve summary.</div></div>
+    </div>
+  </div>
 </div>
 
 <div id="topology" class="tab">
@@ -226,11 +495,16 @@ function authUrl(path){
   return path + (path.indexOf('?') >= 0 ? '&' : '?') + 'token=' + encodeURIComponent(FUSION_TOKEN);
 }
 function showTab(name){
-  for(const t of ['live','activity','topology','sensors','config']){
+  for(const t of ['live','activity','evidence','topology','sensors','config']){
     document.getElementById(t).classList.toggle('active',t===name);
     document.getElementById('tab-'+t).classList.toggle('active',t===name);
   }
   if(name==='sensors') refreshSensors();
+  if(name==='evidence') {
+    evidenceMapInit();
+    setTimeout(()=>{ if (evidenceMap) evidenceMap.invalidateSize(); }, 60);
+    evidenceRefresh();
+  }
   if(name==='topology') topoStart(); else if (typeof topoStop==='function') topoStop();
   if(name==='live') setTimeout(()=>map.invalidateSize(),60);
 }
@@ -678,6 +952,23 @@ es.onmessage=(e)=>{
     noteGeolocated(p);
     return;
   }
+  // REPLAY_GEOLOCATED is a re-solve result (mode event_time or
+  // current_model). Distinct from live GEOLOCATED so the timeline keeps
+  // replay derivations separate from real solves. Stash by
+  // source_event_id + mode so both replay flavors for one source can
+  // coexist; the Evidence tab reads evidenceReplays on every re-render.
+  if(p.event==='REPLAY_GEOLOCATED' && p.source_event_id){
+    const mode = p.replay_mode || 'event_time';
+    evidenceReplays.set(evidenceReplayKey(p.source_event_id, mode), p);
+    if (document.getElementById('evidence').classList.contains('active')) {
+      evidenceRenderTimeline();
+      if (evidenceSelected === p.source_event_id) {
+        const sel = document.querySelector('#ev-timeline .ev-row.selected');
+        if (sel) sel.click();
+      }
+    }
+    return;
+  }
   // STATS heartbeat from a sniffer: 5 s cadence per sensor with msps +
   // cumulative frames/decrypted. Use it to surface per-sensor health.
   if(p.event==='STATS' && p.station){
@@ -843,6 +1134,502 @@ function setStatus(id,msg,ok){
   el.className='hint '+(ok?'status-ok':'status-err');
 }
 function escHtml(s){return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+
+// ---- Evidence tab ----------------------------------------------------------
+//
+// Read-only view of persisted TDOA evidence: cluster_observations,
+// pair_snapshots, solved_fixes, plus clock-sync warnings. No re-solve
+// actions yet -- this is the trust/inspection surface; replay execution
+// lands in a later commit.
+
+let evidenceZoom = '1h';
+let evidenceData = { summary: null, fixes: [], clusters: [], pairs: [], warnings: [] };
+let evidenceSelected = null; // source_event_id of the currently-highlighted row
+
+// evidenceReplays: ephemeral REPLAY_GEOLOCATED results, keyed by
+// "<source_event_id>|<replay_mode>" so both event_time and
+// current_model replays for the same source can coexist. Not
+// persisted -- replays are derivations the operator can re-run, so a
+// page reload clears them.
+const evidenceReplays = new Map();
+let evidenceAdvancedOn = false;
+function evidenceRowKey(from, pid, seq, eventTimeNs){
+  return from + '|' + pid + '|' + (seq || 0) + '|' + eventTimeNs;
+}
+function evidenceReplayKey(sourceEventID, mode){
+  return sourceEventID + '|' + mode;
+}
+function evidenceToggleAdvanced(){
+  evidenceAdvancedOn = !evidenceAdvancedOn;
+  const btn = document.getElementById('ev-advanced-btn');
+  btn.classList.toggle('on', evidenceAdvancedOn);
+  evidenceRenderTimeline();
+}
+
+// Evidence map: dedicated Leaflet instance (NOT the Live map). The two
+// maps have different jobs: Live is real-time situational awareness,
+// Evidence is post-hoc investigation. Sharing the Leaflet helper is fine;
+// sharing the map state is not.
+let evidenceMap = null;
+const evidenceMarkers = new Map(); // rowKey -> {marker, fix}
+let evidenceMapAutoFit = false;
+
+const ZOOM_NS = { '15m': 15*60*1e9, '1h': 60*60*1e9, '6h': 6*60*60*1e9, '24h': 24*60*60*1e9 };
+
+function evidenceMapInit(){
+  if (evidenceMap) return;
+  evidenceMap = L.map('ev-map', { zoomControl: true }).setView([39.5, -98.0], 4);
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
+    { maxZoom: 19, attribution: '(c) OSM (c) CARTO' }).addTo(evidenceMap);
+}
+
+document.querySelectorAll('#ev-zoom button').forEach(b=>{
+  b.addEventListener('click', ()=>{
+    evidenceZoom = b.getAttribute('data-zoom');
+    document.querySelectorAll('#ev-zoom button').forEach(x=>x.classList.toggle('active', x===b));
+    evidenceRefresh();
+  });
+});
+
+async function evidenceFetch(path){
+  try {
+    const r = await fetch(authUrl(path), { headers: authHeaders() });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch(e) { return null; }
+}
+
+async function evidenceRefresh(){
+  const tl = document.getElementById('ev-timeline');
+  tl.innerHTML = '<div class="ev-empty">Loading...</div>';
+  document.getElementById('ev-range-readout').textContent = 'last '+evidenceZoom;
+  const endNs = Date.now() * 1e6; // ms -> ns
+  const startNs = endNs - ZOOM_NS[evidenceZoom];
+  const qs = '?start_ns='+Math.trunc(startNs)+'&end_ns='+Math.trunc(endNs);
+  // Parallel fetch all surfaces.
+  const [summary, fixes, clusters, pairs, warnings] = await Promise.all([
+    evidenceFetch('/api/evidence/summary'),
+    evidenceFetch('/api/evidence/fixes'+qs),
+    evidenceFetch('/api/evidence/clusters'+qs),
+    evidenceFetch('/api/evidence/pairs'+qs),
+    evidenceFetch('/api/clock-sync/warnings'),
+  ]);
+  evidenceData = {
+    summary: summary,
+    fixes: (fixes && fixes.records) || [],
+    clusters: (clusters && clusters.records) || [],
+    pairs: (pairs && pairs.records) || [],
+    warnings: (warnings && warnings.warnings) || [],
+    clockSyncEnabled: warnings ? !!warnings.enabled : false,
+  };
+  evidenceRenderHealth();
+  evidenceRenderWarnings();
+  evidenceRenderMap();
+  evidenceRenderTimeline();
+}
+
+// evidenceRenderMap repopulates the Evidence-tab map from the current
+// fixes list. Pins are tinted by trust class (sync vs software_lock /
+// frame); the currently-selected timeline row's pin is larger and
+// styled in cyan. Auto-fits the map bounds on first render with
+// content, then leaves the view alone so a user pan/zoom is not
+// repeatedly reset by refreshes.
+function evidenceRenderMap(){
+  if (!evidenceMap) return;
+  evidenceMarkers.forEach(m => m.marker.remove());
+  evidenceMarkers.clear();
+  const fixes = evidenceData.fixes || [];
+  const emptyOverlay = document.getElementById('ev-map-empty');
+  if (fixes.length === 0) {
+    if (emptyOverlay) emptyOverlay.style.display = 'flex';
+    return;
+  }
+  if (emptyOverlay) emptyOverlay.style.display = 'none';
+  const TRUST_COLOR = {
+    sample: '#22c55e',
+    sync: '#38bdf8',
+    software_lock: '#f59e0b',
+    frame: '#fb923c',
+  };
+  const latlngs = [];
+  for (const f of fixes) {
+    if (typeof f.lat !== 'number' || typeof f.lon !== 'number') continue;
+    if (f.lat === 0 && f.lon === 0) continue;
+    const color = TRUST_COLOR[f.timestamp_class] || '#94a3b8';
+    const m = L.circleMarker([f.lat, f.lon], {
+      radius: 7, color: color, weight: 2, fillColor: color, fillOpacity: 0.45,
+    }).addTo(evidenceMap);
+    const lockStr = f.timestamp_class ? f.timestamp_class.toUpperCase() : '';
+    m.bindPopup('<b>' + escHtml(f.from) + '</b>' +
+      (f.emission_seq > 0 ? (' #'+f.emission_seq) : '') +
+      '<br>±' + (f.uncertainty_m||0).toFixed(1) + ' m · ' + (f.station_count||0) + ' stations' +
+      (lockStr ? ('<br><span style="color:'+color+'">'+escHtml(lockStr)+'</span>') : ''));
+    const rowKey = f.from + '|' + f.packet_id + '|' + (f.emission_seq || 0);
+    m.on('click', () => {
+      evidenceSelected = rowKey;
+      // Re-render timeline so the matching row highlights, then scroll to it.
+      evidenceRenderTimeline();
+      const sel = document.querySelector('#ev-timeline .ev-row.selected');
+      if (sel) sel.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    });
+    evidenceMarkers.set(rowKey, { marker: m, fix: f });
+    latlngs.push([f.lat, f.lon]);
+  }
+  // Auto-fit once. After the first non-empty render leave panning alone so
+  // an operator who zoomed in to inspect a fix doesn't get yanked away on
+  // the next refresh.
+  if (!evidenceMapAutoFit && latlngs.length > 0) {
+    evidenceMap.fitBounds(latlngs, { padding: [40, 40], maxZoom: 14 });
+    evidenceMapAutoFit = true;
+  }
+}
+
+// evidenceHighlightFix pans the Evidence map to a fix and pops its popup.
+// Called when a timeline row is clicked.
+function evidenceHighlightFix(rowKey){
+  if (!evidenceMap) return;
+  const entry = evidenceMarkers.get(rowKey);
+  if (!entry) return;
+  evidenceMap.panTo(entry.marker.getLatLng(), { animate: true });
+  entry.marker.openPopup();
+}
+
+function evidenceRenderHealth(){
+  const s = evidenceData.summary;
+  const banner = document.getElementById('ev-persisted-banner');
+  if (s && s.persisted) {
+    document.getElementById('ev-db-clusters').textContent = (s.counts && s.counts.cluster_observations) || 0;
+    document.getElementById('ev-db-sub').textContent =
+      ((s.counts && s.counts.cluster_observations) || 0) + ' clusters / ' +
+      ((s.counts && s.counts.solved_fixes) || 0) + ' fixes';
+    document.getElementById('ev-schema').textContent = 'v' + (s.schema_version || 0);
+    document.getElementById('ev-schema-sub').textContent =
+      s.replay_available ? 'replay available' : 'replay disabled';
+    banner.style.display = 'none';
+  } else {
+    document.getElementById('ev-db-clusters').textContent = '—';
+    document.getElementById('ev-db-sub').textContent = 'no state-db attached';
+    document.getElementById('ev-schema').textContent = '—';
+    document.getElementById('ev-schema-sub').textContent = 'replay disabled';
+    banner.innerHTML = '<b style="color:var(--warn-bright)">Running without --state-db.</b> ' +
+      'The Evidence tab needs a persistent bbolt file to render historical events. ' +
+      'Restart fusion with <code style="color:var(--text-2)">--state-db=/path/to/state.db</code> ' +
+      'and the timeline will populate as anchor clusters and solves land.';
+    banner.style.display = 'block';
+  }
+  // Sensors / anchors / pairs counts come from live state (stations[] and
+  // /api/clock-sync/warnings.enabled). The TDOA state label is a simple
+  // client-side rollup for v1; a backend /api/evidence/summary.tdoa_state
+  // can replace it later if the rule grows complex.
+  const sensorsAlive = Object.keys(stations).length;
+  document.getElementById('ev-sensors-count').textContent = sensorsAlive;
+  // Anchors + converged-pair counts aren't yet exposed by a public API; show
+  // best-effort placeholders until /api/clock-sync/stats lands. Warnings still
+  // indicate clock-sync state.
+  const csOn = evidenceData.clockSyncEnabled;
+  document.getElementById('ev-anchors-sub').textContent = csOn ? 'clock-sync on' : 'clock-sync off';
+  document.getElementById('ev-pairs-sub').textContent = csOn ? 'see warnings' : 'n/a';
+  // TDOA rollup, conservative v1 thresholds:
+  //   NOT_READY if fewer than 3 sensors alive
+  //   NO_ANCHOR if clock-sync disabled / no anchors
+  //   DEGRADED if any anchor warning is active
+  //   READY otherwise
+  let state = 'not_ready', sub = 'sensors < 3';
+  if (sensorsAlive >= 3) {
+    if (!csOn) { state = 'no_anchor'; sub = 'no anchors configured'; }
+    else if (evidenceData.warnings.length > 0) { state = 'degraded'; sub = evidenceData.warnings.length + ' warning(s)'; }
+    else { state = 'ready'; sub = 'sensors + sync ok'; }
+  }
+  const el = document.getElementById('ev-tdoa-state');
+  el.textContent = state.toUpperCase().replace('_',' ');
+  el.className = 'ev-value ev-state-'+state;
+  document.getElementById('ev-tdoa-sub').textContent = sub;
+}
+
+function evidenceRenderWarnings(){
+  const host = document.getElementById('ev-warnings');
+  host.innerHTML = '';
+  for (const w of evidenceData.warnings) {
+    const div = document.createElement('div');
+    div.className = 'ev-warn';
+    const code = w.code || 'warning';
+    div.innerHTML = '<b>['+escHtml(code.toUpperCase())+']</b> ' + escHtml(w.message || '');
+    host.appendChild(div);
+  }
+}
+
+function evidenceRenderTimeline(){
+  const tl = document.getElementById('ev-timeline');
+  tl.innerHTML = '';
+  // Interleave fixes + clusters into one timeline. Fixes have
+  // event_time_ns; clusters have cluster_time_ns. Anchor-cluster vs
+  // target-cluster is distinguished from the fact that solved_fixes
+  // suppress anchors (live event loop suppresses GEOLOCATED for declared
+  // anchors), so any cluster whose (from, pid) matches a solved fix is a
+  // target; the rest are either anchors or insufficient-station targets.
+  const fixByKey = new Map();
+  for (const f of evidenceData.fixes) {
+    fixByKey.set(f.from + '|' + f.packet_id + '|' + (f.emission_seq || 0), f);
+  }
+  const rows = [];
+  // timeNs MUST be the *_s string form when available. The numeric
+  // event_time_ns / cluster_time_ns get rounded by JS when they exceed
+  // Number.MAX_SAFE_INTEGER (~9e15); current Unix nanosecond timestamps
+  // are ~1.7e18, well past that, so the rounded value won't match the
+  // exact bbolt key the backend uses for /api/resolve lookups. The
+  // backend populates ClusterTimeNsS / EventTimeNsS for new responses;
+  // older snapshots that lack it fall back to the numeric field for
+  // display only.
+  for (const c of evidenceData.clusters) {
+    const k = c.from + '|' + c.packet_id + '|' + (c.emission_seq || 0);
+    const fix = fixByKey.get(k);
+    const obsCount = (c.observations || []).length;
+    rows.push({
+      timeNs: c.cluster_time_ns_s || String(c.cluster_time_ns),
+      kind: fix ? 'solved' : (c.low_trust ? 'degraded' : 'target'),
+      from: c.from,
+      packetId: c.packet_id,
+      emissionSeq: c.emission_seq || 0,
+      stationCount: obsCount,
+      summary: obsCount + ' station' + (obsCount === 1 ? '' : 's') +
+        (c.preset ? (' · ' + c.preset) : '') +
+        (c.low_trust ? ' · low-trust' : '') +
+        ((c.station_dupes_suppressed||0) > 0 ? (' · dupes=' + c.station_dupes_suppressed) : ''),
+      trust: fix ? fix.timestamp_class : (c.low_trust ? 'degraded' : ''),
+      cluster: c,
+      fix: fix || null,
+    });
+    if (fix) fixByKey.delete(k);
+  }
+  // Any unmatched fix (anchor cluster wasn't retained, or fix lacks a
+  // cluster row) still shows up so the timeline doesn't lie about solves.
+  for (const fix of fixByKey.values()) {
+    rows.push({
+      timeNs: fix.event_time_ns_s || String(fix.event_time_ns),
+      kind: 'solved',
+      from: fix.from,
+      packetId: fix.packet_id,
+      emissionSeq: fix.emission_seq || 0,
+      stationCount: fix.station_count || 0,
+      summary: 'solved · ' + (fix.station_count||0) + ' stations · ±' +
+        Math.round(fix.uncertainty_m||0) + ' m',
+      trust: fix.timestamp_class,
+      cluster: null,
+      fix: fix,
+    });
+  }
+  // timeNs is a base-10 string. All current Unix-ns timestamps are the
+  // same digit length (19), so lexicographic sort matches numeric order
+  // without needing BigInt or Number coercion.
+  rows.sort((a,b) => (b.timeNs > a.timeNs) ? 1 : ((b.timeNs < a.timeNs) ? -1 : 0));
+  if (rows.length === 0) {
+    const persisted = evidenceData.summary && evidenceData.summary.persisted;
+    const total = persisted ?
+      ((evidenceData.summary.counts && evidenceData.summary.counts.cluster_observations) || 0) : 0;
+    if (!persisted) {
+      tl.innerHTML = '<div class="ev-empty">Evidence persistence is off. See the banner above.</div>';
+    } else if (total === 0) {
+      tl.innerHTML = '<div class="ev-empty">' +
+        'Waiting for station feeds and anchor observations.<br><br>' +
+        'New events appear here in real time once sniffers connect and ' +
+        'clock-sync is converging. Operator-declared anchors train the clock ' +
+        'graph; everything else becomes a target.' +
+        '</div>';
+    } else {
+      tl.innerHTML = '<div class="ev-empty">' +
+        'No events in the last ' + evidenceZoom + '. ' + total + ' total in the DB — ' +
+        'try a larger zoom.</div>';
+    }
+    return;
+  }
+  for (const r of rows) {
+    const row = document.createElement('div');
+    row.className = 'ev-row';
+    const trustClass = r.trust ? 'ev-trust ev-trust-'+r.trust : 'ev-trust';
+    const trustText = r.trust ? r.trust.toUpperCase() : '';
+    const tstr = (new Date(Number(r.timeNs)/1e6)).toLocaleTimeString([], {hour12:false});
+    const rowKey = evidenceRowKey(r.from, r.packetId, r.emissionSeq, r.timeNs);
+    const evReplay = evidenceReplays.get(evidenceReplayKey(rowKey, 'event_time'));
+    const cmReplay = evidenceReplays.get(evidenceReplayKey(rowKey, 'current_model'));
+    // Re-solve buttons are only meaningful when we have persisted cluster
+    // observations with enough stations for the solver. A bare fix row
+    // (no cluster) can't be re-solved because the raw observations are
+    // missing from the bucket.
+    const canReplay = r.cluster && (r.stationCount || 0) >= 3;
+    let replayedTag = '';
+    if (evReplay) replayedTag += ' <span class="ev-replay-tag">REPLAY</span>';
+    if (cmReplay) replayedTag += ' <span class="ev-replay-tag current-model">CURRENT-MODEL</span>';
+    let actionHtml = '<div class="ev-row-actions">';
+    if (canReplay) {
+      actionHtml += '<button class="ev-action'+(evReplay?' replayed':'')+
+        '" data-event-id="'+escHtml(rowKey)+'" data-mode="event_time">Replay</button>';
+      if (evidenceAdvancedOn) {
+        actionHtml += '<button class="ev-action danger'+(cmReplay?' replayed':'')+
+          '" data-event-id="'+escHtml(rowKey)+'" data-mode="current_model"' +
+          ' title="Apply TODAY clock model to this OLD event. Not a clean replay.">Current model</button>';
+      }
+    }
+    actionHtml += '</div>';
+    row.innerHTML =
+      '<div class="ev-time">'+escHtml(tstr)+'</div>' +
+      '<div class="ev-kind ev-kind-'+r.kind+'">'+escHtml(r.kind)+'</div>' +
+      '<div class="ev-from">'+escHtml(r.from)+(r.emissionSeq>0?(':#'+r.emissionSeq):'')+'</div>' +
+      '<div class="'+trustClass+'">'+escHtml(trustText)+replayedTag+'</div>' +
+      '<div class="ev-summary">'+escHtml(r.summary)+'</div>' +
+      actionHtml;
+    row.addEventListener('click', () => evidenceShowDetail(r, row));
+    row.querySelectorAll('.ev-action').forEach(btn => {
+      btn.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        const mode = btn.getAttribute('data-mode') || 'event_time';
+        if (mode === 'current_model') {
+          const ok = window.confirm(
+            'Apply TODAY clock model to this OLD event?\n\n' +
+            'This is NOT a clean replay. Today offsets reflect current state, ' +
+            'not the offsets that were valid when this event happened. ' +
+            'Use only when you understand why you want this.');
+          if (!ok) return;
+        }
+        evidenceReplay(r, btn, mode);
+      });
+    });
+    if (evidenceSelected === rowKey) row.classList.add('selected');
+    tl.appendChild(row);
+  }
+}
+
+// evidenceReplay POSTs /api/resolve for the given row in the given
+// mode. The result lands asynchronously via the REPLAY_GEOLOCATED SSE
+// event; this fn only fires the request and gives instant feedback that
+// the action is in flight. The button is intentionally not disabled
+// forever -- if nothing comes back within a few seconds, the operator
+// can retry.
+async function evidenceReplay(r, btn, mode){
+  mode = mode || 'event_time';
+  btn.disabled = true;
+  const wasText = btn.textContent;
+  btn.textContent = mode === 'current_model' ? 'Applying...' : 'Replaying...';
+  try {
+    const resp = await fetch(authUrl('/api/resolve'), {
+      method: 'POST',
+      headers: authHeaders({'Content-Type':'application/json'}),
+      body: JSON.stringify({
+        from: r.from,
+        packet_id: r.packetId,
+        emission_seq: r.emissionSeq,
+        event_time_ns: r.timeNs,
+        mode: mode,
+      }),
+    });
+    if (!resp.ok) {
+      const errText = (await resp.text()).slice(0, 200);
+      btn.textContent = 'Failed';
+      btn.title = errText;
+      setTimeout(() => { btn.textContent = wasText; btn.disabled = false; btn.title = ''; }, 3000);
+      return;
+    }
+    setTimeout(() => { btn.disabled = false; btn.textContent = wasText; }, 1500);
+  } catch (e) {
+    btn.textContent = 'Error';
+    setTimeout(() => { btn.textContent = wasText; btn.disabled = false; }, 3000);
+  }
+}
+
+function evidenceShowDetail(r, rowEl){
+  // Highlight selected row.
+  document.querySelectorAll('#ev-timeline .ev-row').forEach(x=>x.classList.remove('selected'));
+  rowEl.classList.add('selected');
+  evidenceSelected = evidenceRowKey(r.from, r.packetId, r.emissionSeq, r.timeNs);
+  // Pan + open popup for the matching map marker. No-op when the row is
+  // an unsolved cluster (no fix -> no marker on the map).
+  evidenceHighlightFix(r.from + '|' + r.packetId + '|' + r.emissionSeq);
+  const host = document.getElementById('ev-detail');
+  let html = '';
+  html += '<h4>Event</h4>';
+  html += kv('time', new Date(Number(r.timeNs)/1e6).toISOString());
+  html += kv('from', r.from);
+  html += kv('packet_id', String(r.packetId));
+  if (r.emissionSeq > 0) html += kv('emission_seq', String(r.emissionSeq));
+  html += kv('kind', r.kind);
+
+  if (r.fix) {
+    html += '<h4>Solved Fix</h4>';
+    html += kv('lat / lon', r.fix.lat.toFixed(6) + ', ' + r.fix.lon.toFixed(6));
+    html += kv('uncertainty', '±' + (r.fix.uncertainty_m || 0).toFixed(1) + ' m');
+    html += kv('station_count', String(r.fix.station_count || 0));
+    html += kv('iterations', String(r.fix.iterations || 0));
+    html += kv('timestamp_class', (r.fix.timestamp_class || '') +
+      (r.fix.timestamp_class_degraded ? ' (degraded)' : ''));
+    if (r.fix.clock_sync_pair_count > 0) {
+      html += kv('clock_sync_pairs', String(r.fix.clock_sync_pair_count));
+      html += kv('clock_sync_residual', (r.fix.clock_sync_residual_ns||0).toFixed(0) + ' ns');
+      html += kv('clock_sync_anchors', String(r.fix.clock_sync_anchor_count || 0));
+      html += kv('clock_sync_reference', r.fix.clock_sync_reference || '—');
+    }
+    if (r.fix.pair_snapshot_keys_used && r.fix.pair_snapshot_keys_used.length) {
+      html += '<h4>Pair Snapshots Used</h4>';
+      for (const k of r.fix.pair_snapshot_keys_used) {
+        html += '<div class="kv"><span class="k">pair</span><span class="v">'+escHtml(k)+'</span></div>';
+      }
+    }
+  }
+
+  if (r.cluster && r.cluster.observations && r.cluster.observations.length) {
+    html += '<h4>Stations</h4>';
+    html += '<table class="ev-stations"><thead><tr><th>Station</th><th>Lock</th><th>SNR</th></tr></thead><tbody>';
+    for (const o of r.cluster.observations) {
+      const lockNs = o.preamble_lock_t_ns || 0;
+      const lockStr = lockNs > 0 ? new Date(lockNs/1e6).toLocaleTimeString([], {hour12:false}) + '.' + (lockNs % 1000000).toString().padStart(6,'0').slice(0,3) : '—';
+      html += '<tr><td>'+escHtml(o.station||'')+'</td><td>'+escHtml(lockStr)+'</td><td>'+(o.snr_db?o.snr_db.toFixed(1)+' dB':'—')+'</td></tr>';
+    }
+    html += '</tbody></table>';
+    if (r.cluster.station_dupes_suppressed > 0) {
+      html += '<div class="kv" style="margin-top:6px"><span class="k">dupes suppressed</span><span class="v">'+r.cluster.station_dupes_suppressed+'</span></div>';
+    }
+    if (r.cluster.low_trust) {
+      html += '<div class="kv"><span class="k">trust</span><span class="v" style="color:var(--err)">LOW (lock missing for one or more obs)</span></div>';
+    }
+  }
+
+  if (!r.fix && !(r.cluster && r.cluster.observations && r.cluster.observations.length)) {
+    html += '<div class="ev-empty" style="padding-top:20px">No persisted detail for this event yet.</div>';
+  }
+
+  const baseKey = evidenceRowKey(r.from, r.packetId, r.emissionSeq, r.timeNs);
+  for (const mode of ['event_time', 'current_model']) {
+    const replay = evidenceReplays.get(evidenceReplayKey(baseKey, mode));
+    if (!replay) continue;
+    const title = mode === 'current_model'
+      ? 'Replay (current model) <span style="color:var(--warn);font-size:var(--text-xs)">⚠ NOT a clean replay</span>'
+      : 'Replay (event-time)';
+    html += '<h4>'+title+'</h4>';
+    if (replay.advisory) {
+      html += '<div class="ev-warn" style="margin:4px 0">'+escHtml(replay.advisory)+'</div>';
+    }
+    html += kv('replay_mode', replay.replay_mode || '');
+    html += kv('clock_model_time_ns', String(replay.clock_model_time_ns || ''));
+    html += kv('lat / lon', (replay.lat||0).toFixed(6) + ', ' + (replay.lon||0).toFixed(6));
+    html += kv('uncertainty', '±' + (replay.uncertainty_m || 0).toFixed(1) + ' m');
+    html += kv('station_count', String(replay.station_count || 0));
+    html += kv('iterations', String(replay.iterations || 0));
+    html += kv('timestamp_class', (replay.timestamp_class || '') +
+      (replay.timestamp_class_degraded ? ' (degraded)' : ''));
+    if (replay.clock_sync_reference) {
+      html += kv('clock_sync_reference', replay.clock_sync_reference);
+    }
+    if (replay.pair_snapshot_keys_used && replay.pair_snapshot_keys_used.length) {
+      for (const k of replay.pair_snapshot_keys_used) {
+        html += '<div class="kv"><span class="k">pair</span><span class="v">'+escHtml(k)+'</span></div>';
+      }
+    }
+  }
+
+  host.innerHTML = html;
+}
+
+function kv(k,v){
+  return '<div class="kv"><span class="k">'+escHtml(k)+'</span><span class="v">'+escHtml(String(v))+'</span></div>';
+}
 
 // Initial state
 refreshSensors();
